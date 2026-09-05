@@ -1,5 +1,8 @@
 # data lake / large files
-data/
+# NOTE the leading slashes. A bare "data/" matches a directory of that name at
+# ANY depth, which silently excluded the src/tsl/data package from git - the
+# working tree looked fine and a fresh clone was broken.
+/data/
 *.parquet
 *.csv
 *.h5
@@ -20,9 +23,6 @@ config/secrets.yaml
 credentials.json
 
 # outputs
-reports/
-logs/
+/reports/
+/logs/
 *.log
-
-# virtualenv
-.venv/
