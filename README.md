@@ -5,7 +5,8 @@ producing structured trade proposals: **instrument, direction, entry, stop-loss,
 position size, and a confidence score** — with every proposal traceable back to a rule that
 has been backtested and walk-forward validated.
 
-**Status:** design phase. Nothing is implemented yet.
+**Status:** early build. Data pipeline and position sizing are implemented and
+tested; no strategies or backtesting yet.
 
 **Shape so far:** signals and Telegram alerts only (no auto-execution), on EURUSD, GBPUSD,
 USDJPY, AUDUSD and XAUUSD (XAGUSD researched but not tradeable at current account size),
@@ -24,6 +25,52 @@ See [`docs/DECISIONS.md`](docs/DECISIONS.md).
 | [`docs/RESEARCH.md`](docs/RESEARCH.md) | Landscape review: data vendors, broker APIs, backtesting engines, strategy families, and what actually works vs. what doesn't |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Proposed layered design, the signal contract, and a phased build plan |
 | [`docs/OPEN-QUESTIONS.md`](docs/OPEN-QUESTIONS.md) | The full question list, including ones not yet answered |
+
+## Getting started
+
+Requires Python 3.11 or newer.
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -e ".[dev]"
+```
+
+Then:
+
+```bash
+# What is configured, and why silver is excluded
+.venv/bin/python -m tsl instruments
+
+# What would this trade actually cost? (entry, stop)
+.venv/bin/python -m tsl size EURUSD 1.10000 1.09800
+.venv/bin/python -m tsl size XAUUSD 2412.50 2400.50    # watch this one get refused
+
+# Download tick data and store it as bars (start inclusive, end exclusive).
+# Start small - one month is plenty to check everything works.
+.venv/bin/python -m tsl download EURUSD 2024-01-01 2024-02-01
+
+# Is the stored data trustworthy?
+.venv/bin/python -m tsl check EURUSD 15min
+```
+
+Run the tests with `.venv/bin/python -m pytest`.
+
+### First download: what to expect
+
+The Dukascopy decoder has **one unverified assumption** - the factor each
+instrument's prices are scaled by. It could not be checked against real data
+while being written, because the datafeed host is blocked by network policy in
+the authoring environment.
+
+That is handled rather than hoped away: every decoded price is checked against a
+plausible range, and the import aborts with an explanatory message rather than
+storing anything questionable. A wrong scale factor is wrong by a factor of ten
+or more, so your first download of each instrument will either look right or fail
+loudly and tell you which number to change. The metals are the least certain.
+
+Downloads are paced deliberately - Dukascopy is a free service and hammering it
+is both rude and a good way to get blocked. A month of one instrument takes a
+few minutes.
 
 ## Guiding principles
 

@@ -17,6 +17,19 @@
 # VERIFY THESE AGAINST YOUR BROKER before trading real money. Contract sizes and
 # minimum lots are broker-specific, and the spreads below are deliberately
 # pessimistic guesses rather than measured values (we have no broker yet).
+#
+# THE dukascopy BLOCKS ARE UNVERIFIED.
+#   Dukascopy stores tick prices as integers, scaled by an instrument-specific
+#   factor. The factors below are the widely-used values from open-source
+#   downloaders, but they could not be checked against real data from this
+#   environment - Dukascopy's datafeed host is blocked by network policy here.
+#
+#   So they are treated as assumptions, not facts. Every decoded price is checked
+#   against plausible_price on import, and the import ABORTS on a violation rather
+#   than storing rubbish. A wrong scale is off by a factor of 10 or more, so the
+#   range check catches it immediately and loudly on the very first download.
+#
+#   The metals factors are the least certain of the six.
 
 account_currency: USD
 
@@ -33,6 +46,10 @@ instruments:
     pip_size: 0.0001          # for display only; sizing never uses "pips"
     assumed_spread: 0.00012   # 1.2 pips, conservative
     tradeable: true
+    dukascopy:
+      symbol: EURUSD
+      point_scale: 100000    # raw integer / this = price. UNVERIFIED - see below.
+      plausible_price: [0.5, 2.0]   # decoded prices outside this range abort the import
     strategies: [london_breakout, trend_pullback]
 
   GBPUSD:
@@ -46,6 +63,10 @@ instruments:
     pip_size: 0.0001
     assumed_spread: 0.00016   # 1.6 pips
     tradeable: true
+    dukascopy:
+      symbol: GBPUSD
+      point_scale: 100000    # raw integer / this = price. UNVERIFIED - see below.
+      plausible_price: [0.8, 2.5]   # decoded prices outside this range abort the import
     strategies: [london_breakout, trend_pullback]
 
   USDJPY:
@@ -61,6 +82,10 @@ instruments:
     tradeable: true
     # Not london_breakout: USDJPY trades actively during the Asian session, so its
     # overnight range is a full session rather than a quiet coil. See STRATEGY-SPEC.md.
+    dukascopy:
+      symbol: USDJPY
+      point_scale: 1000    # raw integer / this = price. UNVERIFIED - see below.
+      plausible_price: [50, 300]   # decoded prices outside this range abort the import
     strategies: [trend_pullback]
 
   AUDUSD:
@@ -75,6 +100,10 @@ instruments:
     assumed_spread: 0.00016
     tradeable: true
     # Not london_breakout, for the same reason as USDJPY.
+    dukascopy:
+      symbol: AUDUSD
+      point_scale: 100000    # raw integer / this = price. UNVERIFIED - see below.
+      plausible_price: [0.3, 1.2]   # decoded prices outside this range abort the import
     strategies: [trend_pullback]
 
   XAUUSD:
@@ -88,6 +117,10 @@ instruments:
     pip_size: 0.01
     assumed_spread: 0.35      # gold spreads vary a lot and widen sharply on news
     tradeable: true
+    dukascopy:
+      symbol: XAUUSD
+      point_scale: 1000    # raw integer / this = price. UNVERIFIED - see below.
+      plausible_price: [500, 10000]   # decoded prices outside this range abort the import
     strategies: [london_breakout, trend_pullback]
 
   XAGUSD:
@@ -106,4 +139,8 @@ instruments:
       Minimum position size risks more than the per-trade budget at a $1,000
       account. Kept for research (the gold/silver spread) but never signalled.
       Flip to true if the account grows or a broker offers finer granularity.
+    dukascopy:
+      symbol: XAGUSD
+      point_scale: 1000    # raw integer / this = price. UNVERIFIED - see below.
+      plausible_price: [5, 200]   # decoded prices outside this range abort the import
     strategies: []
