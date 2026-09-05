@@ -1,0 +1,52 @@
+# Risk limits. These are hard constraints, not suggestions - the sizing layer
+# enforces every one of them and logs any signal it rejects.
+
+account:
+  currency: USD
+  equity: 1000.00           # used for position sizing; update as the account changes
+
+per_trade:
+  risk_pct: 1.0             # 1% of equity = $10.00 at $1,000
+
+  # THE GUARD RAIL.
+  # If the broker's minimum position size would risk more than the budget, the
+  # trade is skipped and the reason logged. Without this, gold on a volatile day
+  # silently becomes a 1.2%+ trade - taking more risk exactly when conditions are
+  # least predictable. See POSITION-SIZING-REALITY-CHECK.md.
+  #
+  # Set to a value above 1.0 to permit a small overshoot (e.g. 1.05 allows 5%
+  # over budget). 1.0 means no overshoot at all.
+  max_budget_overshoot: 1.0
+
+portfolio:
+  max_open_positions: 3
+  max_positions_per_currency: 2   # long EURUSD + long GBPUSD + short USDJPY is
+                                  # three ways of being short USD, not three trades
+  daily_stop_r: -3.0              # stop signalling for the day after -3R (-$30)
+
+exits:
+  take_profits:
+    - r_multiple: 2.0
+      close_fraction: 0.5
+      move_stop_to_breakeven: true
+    - r_multiple: 3.0
+      close_fraction: 1.0         # 1.0 = whatever remains
+      move_stop_to_breakeven: false
+
+  # A stop is never moved further from entry. Once at breakeven it does not move
+  # again. This single rule prevents the most expensive mistake in discretionary
+  # trading, so it is enforced in code rather than left to discipline.
+  allow_stop_widening: false
+
+session:
+  timezone: Europe/London         # resolved by tzdata, so BST/GMT is automatic
+  signals_from: "07:00"
+  signals_until: "16:00"
+  force_close_at: "16:00"         # nothing is held overnight
+  # Untriggered london_breakout orders are cancelled at this time.
+  breakout_order_expiry: "11:00"
+
+news_blackout:
+  enabled: true
+  minutes_before: 30
+  minutes_after: 30

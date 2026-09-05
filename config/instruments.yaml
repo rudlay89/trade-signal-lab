@@ -1,0 +1,109 @@
+# Instrument specifications.
+#
+# These numbers drive position sizing, so a mistake here is expensive. Every value
+# is checked at load time, and the sizing tests assert against worked examples.
+#
+# HOW THE MATHS WORKS
+#   A price move of D (in the quote currency), holding L lots, is worth:
+#       D  ×  contract_size  ×  L        [in the QUOTE currency]
+#   ...then converted into the account currency.
+#
+#   Example, EURUSD: price moves 0.0010 (10 pips), holding 1.00 lot
+#       0.0010 × 100,000 × 1.00 = $100.00
+#
+#   Example, XAUUSD: price moves $1.00, holding 0.01 lot (= 1 ounce)
+#       1.00 × 100 × 0.01 = $1.00
+#
+# VERIFY THESE AGAINST YOUR BROKER before trading real money. Contract sizes and
+# minimum lots are broker-specific, and the spreads below are deliberately
+# pessimistic guesses rather than measured values (we have no broker yet).
+
+account_currency: USD
+
+instruments:
+
+  EURUSD:
+    kind: fx
+    base: EUR
+    quote: USD
+    contract_size: 100000     # units of the base currency per 1.00 lot
+    min_lot: 0.01
+    lot_step: 0.01
+    price_precision: 5
+    pip_size: 0.0001          # for display only; sizing never uses "pips"
+    assumed_spread: 0.00012   # 1.2 pips, conservative
+    tradeable: true
+    strategies: [london_breakout, trend_pullback]
+
+  GBPUSD:
+    kind: fx
+    base: GBP
+    quote: USD
+    contract_size: 100000
+    min_lot: 0.01
+    lot_step: 0.01
+    price_precision: 5
+    pip_size: 0.0001
+    assumed_spread: 0.00016   # 1.6 pips
+    tradeable: true
+    strategies: [london_breakout, trend_pullback]
+
+  USDJPY:
+    kind: fx
+    base: USD
+    quote: JPY                # quote is NOT the account currency - needs conversion
+    contract_size: 100000
+    min_lot: 0.01
+    lot_step: 0.01
+    price_precision: 3
+    pip_size: 0.01
+    assumed_spread: 0.014     # 1.4 pips
+    tradeable: true
+    # Not london_breakout: USDJPY trades actively during the Asian session, so its
+    # overnight range is a full session rather than a quiet coil. See STRATEGY-SPEC.md.
+    strategies: [trend_pullback]
+
+  AUDUSD:
+    kind: fx
+    base: AUD
+    quote: USD
+    contract_size: 100000
+    min_lot: 0.01
+    lot_step: 0.01
+    price_precision: 5
+    pip_size: 0.0001
+    assumed_spread: 0.00016
+    tradeable: true
+    # Not london_breakout, for the same reason as USDJPY.
+    strategies: [trend_pullback]
+
+  XAUUSD:
+    kind: metal
+    base: XAU
+    quote: USD
+    contract_size: 100        # troy ounces per 1.00 lot
+    min_lot: 0.01             # = 1 ounce, so $1.00 of price move = $1.00 of P&L
+    lot_step: 0.01
+    price_precision: 2
+    pip_size: 0.01
+    assumed_spread: 0.35      # gold spreads vary a lot and widen sharply on news
+    tradeable: true
+    strategies: [london_breakout, trend_pullback]
+
+  XAGUSD:
+    kind: metal
+    base: XAG
+    quote: USD
+    contract_size: 5000       # troy ounces per 1.00 lot
+    min_lot: 0.01             # = 50 ounces. One minimum position risks ~$15 on a
+                              # normal stop, which exceeds the $10 budget.
+    lot_step: 0.01
+    price_precision: 3
+    pip_size: 0.001
+    assumed_spread: 0.025
+    tradeable: false          # research only - see POSITION-SIZING-REALITY-CHECK.md
+    tradeable_note: >-
+      Minimum position size risks more than the per-trade budget at a $1,000
+      account. Kept for research (the gold/silver spread) but never signalled.
+      Flip to true if the account grows or a broker offers finer granularity.
+    strategies: []
