@@ -1,0 +1,25 @@
+# data lake / large files
+data/
+*.parquet
+*.csv
+*.h5
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ipynb_checkpoints/
+*.egg-info/
+
+# secrets — API keys, broker credentials
+.env
+.env.*
+config/secrets.yaml
+credentials.json
+
+# outputs
+reports/
+logs/
+*.log
