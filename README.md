@@ -68,9 +68,24 @@ storing anything questionable. A wrong scale factor is wrong by a factor of ten
 or more, so your first download of each instrument will either look right or fail
 loudly and tell you which number to change. The metals are the least certain.
 
-Downloads are paced deliberately - Dukascopy is a free service and hammering it
-is both rude and a good way to get blocked. A month of one instrument takes a
-few minutes.
+### Downloads are resumable, and will be interrupted
+
+Dukascopy throttles sustained downloading and answers HTTP 503 when it does.
+This is normal, not a fault, and it is designed for rather than treated as an
+error:
+
+* Each day is stored as soon as it is fetched, so an interruption costs time and
+  never work.
+* Completed days are recorded in a manifest. **Re-run the identical command** and
+  it picks up where it stopped.
+* Retries are patient - 5s, 10s, 20s, 40s, 80s - because a throttle clears in
+  tens of seconds, not in two.
+
+If you are being throttled persistently, slow down: `--pause 1.5` puts a second
+and a half between requests. It takes longer and gets there.
+
+Downloading a month of one instrument is a few hundred requests. Be unhurried
+about it; this is a free service.
 
 ## Guiding principles
 

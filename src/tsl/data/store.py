@@ -108,3 +108,48 @@ def _validate(bars: pd.DataFrame) -> None:
         raise ValueError("bars must be indexed by timestamp")
     if bars.index.tz is None:
         raise ValueError("bar index must be timezone-aware UTC; naive timestamps are ambiguous")
+
+
+class DownloadManifest:
+    """Which days have been fully downloaded, per instrument.
+
+    A day is recorded only after every hour in it has been fetched and stored,
+    so a day in the manifest is complete by construction. That makes resuming
+    safe: anything listed can be skipped without checking it again.
+
+    The manifest also records days that legitimately held no ticks - weekends and
+    holidays. Without that, every resume would re-request them forever, since
+    "no bars stored" and "not downloaded yet" are otherwise indistinguishable.
+    """
+
+    def __init__(self, root: str | Path):
+        self.root = Path(root)
+
+    def path_for(self, symbol: str) -> Path:
+        return self.root / "manifest" / f"{symbol}.json"
+
+    def completed_days(self, symbol: str) -> set:
+        import json
+        from datetime import date
+
+        path = self.path_for(symbol)
+        if not path.exists():
+            return set()
+        try:
+            raw = json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError):
+            # A corrupt manifest costs re-downloading, not correctness. Never let
+            # it abort a run.
+            return set()
+        return {date.fromisoformat(d) for d in raw.get("completed_days", [])}
+
+    def mark_complete(self, symbol: str, day) -> None:
+        import json
+
+        done = self.completed_days(symbol)
+        done.add(day)
+        path = self.path_for(symbol)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"symbol": symbol, "completed_days": sorted(d.isoformat() for d in done)}, indent=1)
+        )

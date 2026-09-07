@@ -215,14 +215,37 @@ class DownloadError(RuntimeError):
     """An hour could not be fetched after retrying."""
 
 
+# Status codes worth retrying. 503 is the one that matters in practice: Dukascopy
+# throttles sustained downloading, and returns 503 rather than 429 when it does.
+RETRYABLE_STATUS = frozenset({408, 429, 500, 502, 503, 504})
+
+
+def _retry_after_seconds(response) -> float | None:
+    """Parse a Retry-After header when it is a plain number of seconds.
+
+    The header may also carry an HTTP date; that form is ignored rather than
+    parsed, since the numeric form is what Dukascopy sends and a wrong date
+    parse would be worse than falling back to our own backoff.
+    """
+    raw = response.headers.get("Retry-After")
+    if not raw:
+        return None
+    try:
+        return max(float(raw.strip()), 0.0)
+    except ValueError:
+        return None
+
+
 def download_hour(
     session: requests.Session,
     symbol: str,
     hour: datetime,
     *,
-    attempts: int = 4,
-    backoff: float = 2.0,
+    attempts: int = 6,
+    backoff: float = 5.0,
+    max_backoff: float = 120.0,
     timeout: float = 30.0,
+    on_retry: Callable[[datetime, int, float, str], None] | None = None,
 ) -> bytes:
     """Fetch one hour's raw payload.
 
@@ -230,64 +253,98 @@ def download_hour(
     either a 404 or a zero-length 200 depending on the instrument and age, and
     both mean the same thing: the market was closed. Treating a 404 as a hard
     error would abort every download that crosses a weekend.
+
+    Retries are patient rather than quick. Throttling is the normal failure here,
+    and it clears in tens of seconds, so the backoff runs 5s, 10s, 20s, 40s, 80s
+    rather than giving up inside fifteen. A server-supplied Retry-After wins if
+    it asks for longer.
     """
     url = hour_url(symbol, hour)
-    last: Exception | None = None
+    last = ""
 
     for attempt in range(attempts):
+        delay = min(backoff * (2**attempt), max_backoff)
         try:
             response = session.get(url, timeout=timeout, headers={"User-Agent": USER_AGENT})
             if response.status_code == 404:
                 return b""
             if response.status_code == 200:
                 return response.content
-            # 5xx and rate limiting are worth retrying; other 4xx are not.
-            if response.status_code < 500 and response.status_code != 429:
+            if response.status_code not in RETRYABLE_STATUS:
                 raise DownloadError(f"{url}: HTTP {response.status_code}")
-            last = DownloadError(f"{url}: HTTP {response.status_code}")
+
+            last = f"HTTP {response.status_code}"
+            asked = _retry_after_seconds(response)
+            if asked is not None:
+                delay = max(delay, asked)
         except requests.RequestException as exc:
-            last = exc
+            last = type(exc).__name__
 
         if attempt < attempts - 1:
-            time.sleep(backoff * (2**attempt))
+            if on_retry:
+                on_retry(hour, attempt + 1, delay, last)
+            time.sleep(delay)
 
-    raise DownloadError(f"{url}: giving up after {attempts} attempts ({last})")
+    raise DownloadError(
+        f"{url}: giving up after {attempts} attempts ({last}). "
+        "A run of 503s means Dukascopy is throttling; wait a few minutes and "
+        "re-run the same command - completed days are skipped automatically."
+    )
 
 
-def download_ticks(
-    symbol: str,
+def iter_daily_ticks(
     spec: SourceSpec,
     start: datetime,
     end: datetime,
     *,
     session: requests.Session | None = None,
-    pause: float = 0.15,
+    pause: float = 0.5,
+    skip_days: set = frozenset(),
     on_progress: Callable[[datetime, int], None] | None = None,
-) -> pd.DataFrame:
-    """Download and decode every hour in [start, end).
+    on_retry: Callable[[datetime, int, float, str], None] | None = None,
+):
+    """Yield (day, ticks) for each UTC day in [start, end), oldest first.
 
-    `pause` is a courtesy delay between requests. This is a free service being
-    used for personal research; hammering it is both rude and a good way to get
-    blocked.
+    A generator rather than one big return, so the caller can persist each day as
+    it arrives. That is the difference between a throttled download costing time
+    and costing all the work done so far.
+
+    Days listed in `skip_days` are not requested at all, which is how resuming
+    avoids re-downloading what is already stored.
     """
     owned = session is None
     session = session or requests.Session()
-    frames: list[pd.DataFrame] = []
 
     try:
-        for hour in hours_between(start, end):
-            payload = download_hour(session, spec.symbol, hour)
-            frame = decode_hour(payload, spec, hour)
-            if not frame.empty:
-                frames.append(frame)
-            if on_progress:
-                on_progress(hour, len(frame))
-            if pause:
-                time.sleep(pause)
+        cursor = start.astimezone(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        end = end.astimezone(timezone.utc)
+
+        while cursor < end:
+            day_end = min(cursor + timedelta(days=1), end)
+            day_key = cursor.date()
+
+            if day_key in skip_days:
+                cursor = cursor + timedelta(days=1)
+                continue
+
+            frames = []
+            for hour in hours_between(max(cursor, start), day_end):
+                payload = download_hour(session, spec.symbol, hour, on_retry=on_retry)
+                frame = decode_hour(payload, spec, hour)
+                if not frame.empty:
+                    frames.append(frame)
+                if on_progress:
+                    on_progress(hour, len(frame))
+                if pause:
+                    time.sleep(pause)
+
+            ticks = (
+                pd.concat(frames, ignore_index=True).sort_values("timestamp").reset_index(drop=True)
+                if frames
+                else _empty_ticks()
+            )
+            yield cursor, ticks
+            cursor = cursor + timedelta(days=1)
     finally:
         if owned:
             session.close()
-
-    if not frames:
-        return _empty_ticks()
-    return pd.concat(frames, ignore_index=True).sort_values("timestamp").reset_index(drop=True)

@@ -13,14 +13,14 @@ from __future__ import annotations
 
 import argparse
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from .data.bars import resample_bars, ticks_to_bars
 from .data.dukascopy import SourceSpec
 from .data.quality import check_bars
-from .data.store import BarStore
+from .data.store import BarStore, DownloadManifest
 from .instruments import load_instruments
 from .risk import load_risk_config, size_position
 
@@ -94,7 +94,7 @@ def cmd_size(args) -> int:
 
 
 def cmd_download(args) -> int:
-    from .data.dukascopy import download_ticks
+    from .data.dukascopy import DownloadError, iter_daily_ticks
 
     universe, _ = _load(args.config)
     spec = universe[args.symbol]
@@ -103,38 +103,73 @@ def cmd_download(args) -> int:
     if end <= start:
         raise SystemExit("end date must be after start date")
 
-    hours = int((end - start).total_seconds() // 3600)
-    print(f"Downloading {spec.symbol} ticks, {start:%Y-%m-%d} to {end:%Y-%m-%d} ({hours} hours).")
-    print("Dukascopy is a free service - this is deliberately paced and will take a while.\n")
+    store = BarStore(args.data)
+    manifest = DownloadManifest(args.data)
+    already = manifest.completed_days(args.symbol) if not args.restart else set()
 
-    seen = {"hours": 0, "ticks": 0}
+    total_days = (end - start).days
+    print(f"Downloading {spec.symbol}, {start:%Y-%m-%d} to {end:%Y-%m-%d} ({total_days} days).")
+    if already:
+        pending = sum(
+            1 for i in range(total_days) if (start + timedelta(days=i)).date() not in already
+        )
+        print(f"{len(already)} day(s) already downloaded and will be skipped; {pending} to fetch.")
+    print("Dukascopy is free and throttles heavy use, so this is paced deliberately.")
+    print("If it stops, just run the same command again - finished days are not re-fetched.\n")
 
     def progress(hour, count):
-        seen["hours"] += 1
-        seen["ticks"] += count
-        if seen["hours"] % 24 == 0 or count == 0:
-            pct = 100 * seen["hours"] / max(hours, 1)
-            print(f"  {hour:%Y-%m-%d %H}h  {seen['ticks']:>9,} ticks  ({pct:.0f}%)", flush=True)
+        if hour.hour == 0:
+            print(f"  {hour:%Y-%m-%d}  ", end="", flush=True)
 
-    ticks = download_ticks(args.symbol, source, start, end, on_progress=progress)
+    def retry(hour, attempt, delay, why):
+        print(f"\n    {why} on {hour:%Y-%m-%d %H}h - waiting {delay:.0f}s "
+              f"(attempt {attempt}), this is throttling, not a fault", flush=True)
 
-    if ticks.empty:
-        print("\nNo ticks returned. If the whole range was a weekend that is expected;")
-        print("otherwise check the symbol name in the dukascopy block of instruments.yaml.")
+    stored_days = 0
+    stored_bars = 0
+    try:
+        for day, ticks in iter_daily_ticks(
+            source, start, end,
+            pause=args.pause, skip_days=already,
+            on_progress=progress, on_retry=retry,
+        ):
+            if ticks.empty:
+                # Weekend or holiday. Record it so a resume does not ask again.
+                manifest.mark_complete(args.symbol, day.date())
+                print("no ticks (market closed)", flush=True)
+                continue
+
+            bars = ticks_to_bars(ticks, BASE_TIMEFRAME)
+            store.write(args.symbol, BASE_TIMEFRAME, bars)
+            for timeframe in ("15min", "1h", "4h"):
+                store.write(args.symbol, timeframe, resample_bars(bars, timeframe))
+
+            manifest.mark_complete(args.symbol, day.date())
+            stored_days += 1
+            stored_bars += len(bars)
+            print(f"{len(ticks):>9,} ticks -> {len(bars):>5,} bars  (saved)", flush=True)
+
+    except DownloadError as exc:
+        # Not a traceback. The work so far is already on disk.
+        print(f"\n\nDownload stopped: {exc}\n")
+        print(f"Saved before stopping: {stored_days} day(s), {stored_bars:,} {BASE_TIMEFRAME} bars.")
+        print("Nothing is lost. Re-run the same command to continue where it left off.")
+        return 3
+    except KeyboardInterrupt:
+        print(f"\n\nInterrupted. Saved {stored_days} day(s) - re-run to continue.")
+        return 130
+
+    if stored_days == 0:
+        print("\nNothing new downloaded.")
+        if already:
+            print("Every day in that range was already stored. Use --restart to force a re-download.")
+            return 0
+        print("If the whole range was a weekend that is expected; otherwise check the")
+        print("symbol name in the dukascopy block of config/instruments.yaml.")
         return 1
 
-    bars = ticks_to_bars(ticks, BASE_TIMEFRAME)
-    store = BarStore(args.data)
-    written = store.write(args.symbol, BASE_TIMEFRAME, bars)
-    print(f"\nStored {len(bars):,} {BASE_TIMEFRAME} bars from {len(ticks):,} ticks "
-          f"into {len(written)} file(s).")
-
-    for timeframe in ("15min", "1h", "4h"):
-        rolled = resample_bars(bars, timeframe)
-        store.write(args.symbol, timeframe, rolled)
-        print(f"  rolled up to {timeframe}: {len(rolled):,} bars")
-
-    report = check_bars(bars, args.symbol, BASE_TIMEFRAME)
+    print(f"\nStored {stored_bars:,} {BASE_TIMEFRAME} bars across {stored_days} day(s).")
+    report = check_bars(store.read(args.symbol, BASE_TIMEFRAME), args.symbol, BASE_TIMEFRAME)
     print("\n" + str(report))
     return 0 if report.ok else 2
 
@@ -169,6 +204,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("symbol")
     p.add_argument("start", help="YYYY-MM-DD, inclusive")
     p.add_argument("end", help="YYYY-MM-DD, exclusive")
+    p.add_argument("--pause", type=float, default=0.5,
+                   help="seconds between requests (default 0.5; raise it if throttled)")
+    p.add_argument("--restart", action="store_true",
+                   help="re-download days already recorded as complete")
     p.set_defaults(func=cmd_download)
 
     p = sub.add_parser("check", help="run quality checks over stored bars")
