@@ -276,6 +276,15 @@ def cmd_verify_candles(args) -> int:
                 print("no candles returned (market closed?)")
                 continue
 
+            order = from_candles.attrs.get("field_order")
+            if order:
+                print(f"decoded as {'/'.join(order)}")
+                print(f"  {'':10}  ", end="")
+            if "ambiguous" in from_candles.attrs:
+                print("\n    NOTE: more than one field order was self-consistent on this")
+                print("          day. The comparison below is what settles it.")
+                print(f"  {'':10}  ", end="")
+
             from_ticks = stored[stored.index.normalize().date == day]
             result = compare_bar_series(from_ticks, from_candles)
 
@@ -299,8 +308,9 @@ def cmd_verify_candles(args) -> int:
     finally:
         session.close()
 
-    print("\nCandle format verified. Bulk downloads can use it, which is roughly")
-    print("twelve times fewer requests than tick files for the same 1-minute bars.")
+    print("\nCandle format verified against independently derived tick data.")
+    print("Bulk downloads can use it - roughly twelve times fewer requests than")
+    print("tick files for the same 1-minute bars.")
     return 0
 
 

@@ -59,7 +59,7 @@ def test_days_between_is_half_open():
 
 def test_decode_round_trip():
     bars = _gold_bars()
-    decoded = decode_candles(synthetic_candle_file(bars, DAY), GOLD, DAY, "BID")
+    decoded = decode_candles(synthetic_candle_file(bars, DAY, GOLD.point_scale), GOLD, DAY, "BID")
 
     assert len(decoded) == len(bars)
     for column in ("open", "high", "low", "close"):
@@ -80,35 +80,52 @@ def test_truncated_file_names_the_layout_as_a_suspect():
         decode_candles(payload, GOLD, DAY, "BID")
 
 
-def test_wrong_field_order_is_caught():
-    """THE CENTRAL RISK. Dukascopy uses open, CLOSE, low, high - an unusual order
-    that is easy to assume is the conventional open, high, low, close.
+def test_the_layout_actually_used_is_recorded_not_assumed():
+    bars = _gold_bars()
+    decoded = decode_candles(synthetic_candle_file(bars, DAY, GOLD.point_scale), GOLD, DAY, "BID")
+    assert decoded.attrs["field_order"] == ("open", "close", "low", "high")
 
-    Written in the conventional order and read with our assumption, the nominal
-    'high' becomes the real close, which is almost never the highest of the four.
+
+def test_each_candidate_order_is_recognised():
+    """Both orders decode correctly when the data really is in that order. The
+    decoder eliminates the impossible rather than insisting on one answer."""
+    bars = _gold_bars()
+    for order in (("open", "close", "low", "high"), ("open", "high", "low", "close")):
+        payload = synthetic_candle_file(bars, DAY, GOLD.point_scale, field_order=order)
+        decoded = decode_candles(payload, GOLD, DAY, "BID")
+        pd.testing.assert_series_equal(
+            decoded["high"], bars["high"], check_names=False, check_freq=False, rtol=1e-4
+        )
+
+
+def test_an_explicit_field_order_that_is_wrong_is_refused():
+    """Pinning a layout means it must validate, not be taken on trust."""
+    bars = _gold_bars()
+    payload = synthetic_candle_file(bars, DAY, GOLD.point_scale,
+                                    field_order=("open", "close", "low", "high"))
+    with pytest.raises(DecodeError, match="no candidate field order"):
+        decode_candles(payload, GOLD, DAY, "BID",
+                       field_order=("open", "high", "low", "close"))
+
+
+def test_float_prices_are_rejected():
+    """REGRESSION. The first version of this module assumed float32 prices. Real
+    files use int32 scaled by point_scale, and because both records are 24 bytes
+    the size check passed and gold decoded as a 2.8e-39 denormal.
     """
     bars = _gold_bars()
-    wrong = synthetic_candle_file(bars, DAY, field_order=("open", "high", "low", "close"))
-
-    with pytest.raises(DecodeError, match="wrong field order"):
-        decode_candles(wrong, GOLD, DAY, "BID")
-
-
-def test_wrong_field_order_message_names_the_fix():
-    bars = _gold_bars()
-    wrong = synthetic_candle_file(bars, DAY, field_order=("open", "high", "low", "close"))
+    payload = synthetic_candle_file(bars, DAY, GOLD.point_scale, as_floats=True)
     with pytest.raises(DecodeError) as exc:
-        decode_candles(wrong, GOLD, DAY, "BID")
-    assert "open, high, low, close" in str(exc.value)
-    assert "Nothing has been stored" in str(exc.value)
+        decode_candles(payload, GOLD, DAY, "BID")
+    assert "no candidate field order" in str(exc.value)
+    assert "point_scale" in str(exc.value)
 
 
 def test_prices_outside_the_plausible_band_are_refused():
-    """Candle prices are plain floats, so this points at the layout, not a scale."""
     bars = _gold_bars()
     for column in ("open", "high", "low", "close"):
         bars[column] = bars[column] / 1000.0
-    payload = synthetic_candle_file(bars, DAY)
+    payload = synthetic_candle_file(bars, DAY, GOLD.point_scale)
     with pytest.raises(DecodeError, match="plausible range"):
         decode_candles(payload, GOLD, DAY, "BID")
 
@@ -116,7 +133,7 @@ def test_prices_outside_the_plausible_band_are_refused():
 def test_impossible_time_offset_is_refused():
     import struct
 
-    body = struct.pack(">i5f", 999_999, 2030.0, 2031.0, 2029.0, 2032.0, 1.0)
+    body = struct.pack(">5if", 999_999, 2030000, 2031000, 2029000, 2032000, 1.0)
     payload = lzma.compress(body, format=lzma.FORMAT_ALONE)
     with pytest.raises(DecodeError, match="outside the day"):
         decode_candles(payload, GOLD, DAY, "BID")

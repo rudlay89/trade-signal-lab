@@ -11,36 +11,37 @@ Two requests per day instead of twenty-four, for the same 1-minute bars. Over a
 multi-year download that is the difference between hours and days, which matters
 a great deal when the server throttles sustained use.
 
-FORMAT - ASSUMED, AND VERIFIED BY COMPARISON RATHER THAN BY FAITH.
+FORMAT - DETERMINED FROM REAL DATA, NOT ASSUMED.
 
-    RECORD  24 bytes, big-endian, ">i5f":
+    RECORD  24 bytes, big-endian, ">5if":
               int32    seconds after the start of the UTC day
-              float32  open
-              float32  close     <- NOTE the order: open, CLOSE, low, high
-              float32  low
-              float32  high
+              int32    price, scaled by the instrument's point_scale
+              int32    price
+              int32    price
+              int32    price
               float32  volume
 
-    Prices are plain floats here, NOT integers needing point_scale, which is the
-    main difference from the tick format.
+Prices are SCALED INTEGERS, exactly as in the tick format - not floats. That was
+originally assumed the other way round, and the first real download caught it:
+gold decoded as 2.8e-39, a denormalised float. Reversing that denormal gives the
+integer 2,046,523, which over point_scale 1000 is 2046.52 - precisely the day's
+high in the tick-derived bars. A float32 record of the same width read the same
+bytes without complaint, which is why the size check did not catch it.
 
-The open/close/low/high ordering is the part most likely to be wrong, and it is
-an unusual order that is easy to assume away. Two defences:
+The ORDER of the four prices is still not known from documentation, so it is not
+guessed either. `decode_candles` tries the candidate layouts and keeps only those
+that are internally consistent - a high that really is the highest of the four
+and a low that really is the lowest. A wrong order violates that on nearly every
+candle, so it eliminates itself.
 
-  1. `decode_candles` enforces OHLC consistency - high must be the highest of the
-     four and low the lowest. Reading the fields in the wrong order breaks that
-     on nearly every candle, so a mistake fails immediately.
-  2. `tsl verify-candles` downloads days that were already built from ticks and
-     compares the two bar series directly. Agreement to a fraction of a spread
-     proves the layout; nothing else does.
-
-Do not trust this module for a large download until step 2 has passed.
+Internal consistency narrows the field; it does not close it. `tsl verify-candles`
+does that, by rebuilding days already derived from raw ticks and comparing them
+minute by minute. Two independent paths agreeing is the proof.
 """
 
 from __future__ import annotations
 
 import lzma
-import struct
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
@@ -48,10 +49,24 @@ import pandas as pd
 
 from .dukascopy import BASE_URL, DecodeError, SourceSpec
 
-CANDLE = struct.Struct(">i5f")
-CANDLE_SIZE = CANDLE.size  # 24
+CANDLE_SIZE = 24  # int32 offset + 4x int32 price + float32 volume
 
 SIDES = ("BID", "ASK")
+
+# Candidate field orders for the four prices. Documentation does not settle this,
+# so both plausible orders are tried and the inconsistent ones discarded. Listing
+# them explicitly beats a comment claiming to know.
+CANDIDATE_ORDERS = (
+    ("open", "close", "low", "high"),   # the order Dukascopy is usually said to use
+    ("open", "high", "low", "close"),   # the conventional OHLC order
+)
+
+_DTYPE = np.dtype([
+    ("offset", ">i4"),
+    ("a", ">i4"), ("b", ">i4"), ("c", ">i4"), ("d", ">i4"),
+    ("volume", ">f4"),
+])
+_SLOTS = ("a", "b", "c", "d")
 
 
 def candle_url(symbol: str, day: datetime, side: str) -> str:
@@ -68,11 +83,21 @@ def candle_url(symbol: str, day: datetime, side: str) -> str:
     )
 
 
-def decode_candles(payload: bytes, spec: SourceSpec, day: datetime, side: str) -> pd.DataFrame:
+def decode_candles(
+    payload: bytes,
+    spec: SourceSpec,
+    day: datetime,
+    side: str,
+    field_order: tuple | None = None,
+) -> pd.DataFrame:
     """Decode one day of one-sided 1-minute candles.
 
-    Returns a frame indexed by timestamp with open/high/low/close/volume. An
-    empty payload means a closed market, which is not an error.
+    With `field_order` given, that layout is used and must validate. Without it,
+    the candidates are tried and the ones that are internally inconsistent are
+    discarded. The layout actually used is recorded on the frame's `attrs`, so
+    callers can report it rather than assume it.
+
+    An empty payload means a closed market, which is not an error.
     """
     if day.tzinfo is None:
         raise ValueError("`day` must be timezone-aware UTC")
@@ -98,26 +123,94 @@ def decode_candles(payload: bytes, spec: SourceSpec, day: datetime, side: str) -
             "the record layout assumed in candles.py is wrong."
         )
 
-    arr = np.frombuffer(raw, dtype=np.dtype([
-        ("offset", ">i4"),
-        ("open", ">f4"), ("close", ">f4"), ("low", ">f4"), ("high", ">f4"),
-        ("volume", ">f4"),
-    ]), count=len(raw) // CANDLE_SIZE)
+    arr = np.frombuffer(raw, dtype=_DTYPE, count=len(raw) // CANDLE_SIZE)
+    where = f"{spec.symbol} {day:%Y-%m-%d} {side}"
 
-    frame = pd.DataFrame({
-        "open": arr["open"].astype(np.float64),
-        "high": arr["high"].astype(np.float64),
-        "low": arr["low"].astype(np.float64),
-        "close": arr["close"].astype(np.float64),
-        "volume": arr["volume"].astype(np.float64),
-    })
-    frame.index = pd.to_datetime(day.astimezone(timezone.utc)) + pd.to_timedelta(
-        arr["offset"].astype(np.int64), unit="s"
+    offsets = arr["offset"]
+    bad_offset = int(((offsets < 0) | (offsets >= 86400)).sum())
+    if bad_offset:
+        raise DecodeError(
+            f"{where}: {bad_offset} candle(s) have a time offset outside the day "
+            "(0-86399 seconds). The record layout in candles.py is wrong."
+        )
+
+    index = pd.to_datetime(day.astimezone(timezone.utc)) + pd.to_timedelta(
+        offsets.astype(np.int64), unit="s"
     )
-    frame.index.name = "timestamp"
 
-    _validate_candles(frame, arr["offset"], spec, day, side)
-    return frame.sort_index()
+    orders = (tuple(field_order),) if field_order else CANDIDATE_ORDERS
+    accepted, rejections = [], []
+
+    for order in orders:
+        frame = _build(arr, index, order, spec)
+        problem = _inconsistency(frame, spec)
+        if problem is None:
+            frame.attrs["field_order"] = order
+            accepted.append(frame)
+        else:
+            rejections.append(f"    {'/'.join(order)}: {problem}")
+
+    if not accepted:
+        raise DecodeError(
+            f"{where}: no candidate field order produces self-consistent candles.\n"
+            + "\n".join(rejections)
+            + "\n  Prices are read as int32 scaled by point_scale "
+            f"({spec.point_scale:g}). If that is wrong, or the record is not "
+            "24 bytes, candles.py needs the real layout. Nothing has been stored."
+        )
+
+    if len(accepted) > 1 and not field_order:
+        # Both orders self-consistent. Possible on a degenerate day; the
+        # tick comparison in verify-candles is the arbiter, so carry on with the
+        # first but leave a marker so it can be reported rather than hidden.
+        accepted[0].attrs["ambiguous"] = [f.attrs["field_order"] for f in accepted]
+
+    return accepted[0].sort_index()
+
+
+def _build(arr, index, order: tuple, spec: SourceSpec) -> pd.DataFrame:
+    """Assemble a frame reading the four price slots in the given order."""
+    data = {
+        name: arr[slot].astype(np.float64) / spec.point_scale
+        for slot, name in zip(_SLOTS, order)
+    }
+    frame = pd.DataFrame(data, index=index)
+    frame["volume"] = arr["volume"].astype(np.float64)
+    frame.index.name = "timestamp"
+    return frame[["open", "high", "low", "close", "volume"]]
+
+
+def _inconsistency(frame: pd.DataFrame, spec: SourceSpec) -> str | None:
+    """Return why this layout cannot be right, or None if it survives.
+
+    Two independent tests. Prices must be in a plausible band for the instrument,
+    and high/low must genuinely bracket open/close - which a wrong field order
+    breaks on nearly every candle.
+    """
+    prices = frame[["open", "high", "low", "close"]]
+    values = prices.to_numpy()
+
+    if not np.isfinite(values).all():
+        return "non-finite prices"
+
+    low, high = float(values.min()), float(values.max())
+    if low < spec.plausible_low or high > spec.plausible_high:
+        return (
+            f"prices span {low:.6g}..{high:.6g}, outside the plausible range "
+            f"{spec.plausible_low:g}..{spec.plausible_high:g}"
+        )
+
+    broken = int((
+        (frame["high"] < frame["low"])
+        | (frame["high"] < frame[["open", "close"]].max(axis=1))
+        | (frame["low"] > frame[["open", "close"]].min(axis=1))
+    ).sum())
+    if broken:
+        return (
+            f"{broken} of {len(frame)} candles have a high that is not the highest "
+            "of the four prices, or a low that is not the lowest"
+        )
+    return None
 
 
 def _empty_candles() -> pd.DataFrame:
@@ -126,46 +219,6 @@ def _empty_candles() -> pd.DataFrame:
     )
     frame.index = pd.DatetimeIndex([], tz="UTC", name="timestamp")
     return frame
-
-
-def _validate_candles(frame, offsets, spec: SourceSpec, day: datetime, side: str) -> None:
-    """Catch a wrong record layout on the first file, not after a year of downloading."""
-    where = f"{spec.symbol} {day:%Y-%m-%d} {side}"
-
-    bad_offset = int(((offsets < 0) | (offsets >= 86400)).sum())
-    if bad_offset:
-        raise DecodeError(
-            f"{where}: {bad_offset} candle(s) have a time offset outside the day "
-            "(0-86399 seconds). The record layout in candles.py is wrong."
-        )
-
-    prices = frame[["open", "high", "low", "close"]]
-    if not np.isfinite(prices.to_numpy()).all():
-        raise DecodeError(f"{where}: non-finite prices decoded; the record layout is wrong.")
-
-    low, high = float(prices.min().min()), float(prices.max().max())
-    if low < spec.plausible_low or high > spec.plausible_high:
-        raise DecodeError(
-            f"{where}: prices span {low:.6g}..{high:.6g}, outside the plausible range "
-            f"{spec.plausible_low:g}..{spec.plausible_high:g}. Candle prices are plain "
-            "floats and need no point_scale, so this points at the record layout."
-        )
-
-    # THE ORDERING CHECK. If open/close/low/high were read in the wrong order, the
-    # nominal high stops being the highest of the four on almost every candle.
-    inconsistent = int((
-        (frame["high"] < frame["low"])
-        | (frame["high"] < frame[["open", "close"]].max(axis=1))
-        | (frame["low"] > frame[["open", "close"]].min(axis=1))
-    ).sum())
-    if inconsistent:
-        raise DecodeError(
-            f"{where}: {inconsistent} of {len(frame)} candles have a high that is not "
-            "the highest of the four prices, or a low that is not the lowest.\n"
-            "That is what a wrong field order looks like. candles.py assumes the "
-            "order open, CLOSE, low, high - if Dukascopy uses open, high, low, close "
-            "instead, that is the fix. Nothing has been stored."
-        )
 
 
 def candles_to_bars(bid: pd.DataFrame, ask: pd.DataFrame) -> pd.DataFrame:
@@ -223,14 +276,36 @@ def download_day_candles(
     session: requests.Session,
     spec: SourceSpec,
     day: datetime,
+    field_order: tuple | None = None,
     **kwargs,
 ) -> pd.DataFrame:
-    """Fetch and combine both sides of one day's 1-minute candles."""
+    """Fetch and combine both sides of one day's 1-minute candles.
+
+    The layout actually used is recorded on the returned frame's `attrs`, so it
+    can be reported rather than silently assumed.
+    """
     sides = {}
     for side in SIDES:
         payload = download_url(session, candle_url(spec.symbol, day, side), day, **kwargs)
-        sides[side] = decode_candles(payload, spec, day, side)
-    return candles_to_bars(sides["BID"], sides["ASK"])
+        sides[side] = decode_candles(payload, spec, day, side, field_order=field_order)
+
+    bid, ask = sides["BID"], sides["ASK"]
+    if not bid.empty and not ask.empty:
+        bid_order = bid.attrs.get("field_order")
+        ask_order = ask.attrs.get("field_order")
+        if bid_order != ask_order:
+            raise DecodeError(
+                f"{spec.symbol} {day:%Y-%m-%d}: the bid file decodes as "
+                f"{'/'.join(bid_order)} but the ask file as {'/'.join(ask_order)}. "
+                "Both sides must share a layout; something is wrong."
+            )
+
+    bars = candles_to_bars(bid, ask)
+    if not bid.empty:
+        bars.attrs["field_order"] = bid.attrs.get("field_order")
+        if "ambiguous" in bid.attrs:
+            bars.attrs["ambiguous"] = bid.attrs["ambiguous"]
+    return bars
 
 
 def compare_bar_series(from_ticks: pd.DataFrame, from_candles: pd.DataFrame) -> dict:

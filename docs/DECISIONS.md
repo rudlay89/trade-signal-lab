@@ -206,14 +206,30 @@ side: `{SYMBOL}/{YYYY}/{MM}/{DD}/{BID|ASK}_candles_min_1.bi5`. Two requests per
 instrument-day instead of twenty-four, for the same 1-minute bars.
 
 **Consequence:** bulk history comes from candle files; tick files stay available
-for any period needing sub-minute detail. The candle record layout is assumed
-(open, **close**, low, high — an unusual order), so it is verified rather than
-trusted:
-- the decoder rejects any file where the nominal high is not the highest of the
-  four prices, which is what a wrong field order produces on nearly every candle;
-- `tsl verify-candles` rebuilds days already derived from raw ticks and compares
-  them minute by minute. Two independent paths agreeing is proof; a plausibility
-  check is not.
+for any period needing sub-minute detail.
+
+**The candle record layout, determined from real data.** The first attempt
+assumed float32 prices. It was wrong, and the first download caught it: gold
+decoded as 2.8e-39, a denormalised float. Reversing that denormal gives the
+integer 2,046,523, which over `point_scale` 1000 is 2046.52 — precisely the
+day's high in the tick-derived bars. Candle prices are **int32 scaled by
+point_scale**, exactly as ticks are.
+
+That mistake is worth recording because of *how* it hid: a float32 record and an
+int32 record are both 24 bytes, so the record-size check passed cleanly. Only the
+plausible-range check caught it. Had the range been wider, or the scale error
+smaller, it would have stored silently — which is the whole argument for
+validating decoded values rather than just their shape.
+
+The ORDER of the four prices is still not established from documentation, so it
+is not guessed. The decoder tries the candidate orders and discards any that is
+internally inconsistent — a high that is not the highest of the four, or a low
+that is not the lowest, which a wrong order breaks on nearly every candle. If
+more than one survives, that is recorded as ambiguous rather than hidden.
+
+Internal consistency narrows; it does not conclude. `tsl verify-candles` does
+that, rebuilding days already derived from raw ticks and comparing them minute by
+minute. Two independent paths agreeing is the proof.
 
 ---
 

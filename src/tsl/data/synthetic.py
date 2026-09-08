@@ -71,12 +71,22 @@ def synthetic_bi5(ticks: pd.DataFrame, hour_start: datetime, point_scale: float)
     return lzma.compress(bytes(out), format=lzma.FORMAT_ALONE)
 
 
-def synthetic_candle_file(bars, day, *, field_order=("open", "close", "low", "high")) -> bytes:
+def synthetic_candle_file(
+    bars,
+    day,
+    point_scale: float,
+    *,
+    field_order=("open", "close", "low", "high"),
+    as_floats: bool = False,
+) -> bytes:
     """Encode bars into the Dukascopy daily candle wire format.
 
-    `field_order` exists so tests can deliberately write the fields in the WRONG
-    order and prove the decoder rejects it. That check is the whole reason the
-    candle format can be trusted before it has been seen in the wild.
+    Prices are int32 scaled by `point_scale`, as the real files use.
+
+    `field_order` lets tests write the fields in the WRONG order and prove the
+    decoder eliminates it. `as_floats` reproduces the original mistaken
+    assumption - a same-width record of float32 prices - so the regression is
+    covered rather than merely remembered.
     """
     import lzma
     import struct
@@ -85,10 +95,14 @@ def synthetic_candle_file(bars, day, *, field_order=("open", "close", "low", "hi
     out = bytearray()
     for ts, row in bars.iterrows():
         offset = int((pd.Timestamp(ts).to_pydatetime() - day).total_seconds())
-        out += struct.pack(
-            ">i5f",
-            offset,
-            *[float(row[name]) for name in field_order],
-            float(row.get("volume", 0.0)),
-        )
+        prices = [float(row[name]) for name in field_order]
+        if as_floats:
+            out += struct.pack(">i5f", offset, *prices, float(row.get("volume", 0.0)))
+        else:
+            out += struct.pack(
+                ">5if",
+                offset,
+                *[int(round(p * point_scale)) for p in prices],
+                float(row.get("volume", 0.0)),
+            )
     return lzma.compress(bytes(out), format=lzma.FORMAT_ALONE)
