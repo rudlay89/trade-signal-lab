@@ -236,10 +236,10 @@ def _retry_after_seconds(response) -> float | None:
         return None
 
 
-def download_hour(
+def download_url(
     session: requests.Session,
-    symbol: str,
-    hour: datetime,
+    url: str,
+    when: datetime,
     *,
     attempts: int = 6,
     backoff: float = 5.0,
@@ -247,26 +247,28 @@ def download_hour(
     timeout: float = 30.0,
     on_retry: Callable[[datetime, int, float, str], None] | None = None,
 ) -> bytes:
-    """Fetch one hour's raw payload.
+    """Fetch one .bi5 file, retrying patiently through throttling.
 
-    Returns empty bytes for an hour with no data. Dukascopy signals that as
-    either a 404 or a zero-length 200 depending on the instrument and age, and
-    both mean the same thing: the market was closed. Treating a 404 as a hard
-    error would abort every download that crosses a weekend.
+    Returns empty bytes when there is no data. Dukascopy signals that as either a
+    404 or a zero-length 200 depending on the instrument and age, and both mean
+    the same thing: the market was closed. Treating a 404 as a hard error would
+    abort every download that crosses a weekend.
 
     Retries are patient rather than quick. Throttling is the normal failure here,
     and it clears in tens of seconds, so the backoff runs 5s, 10s, 20s, 40s, 80s
     rather than giving up inside fifteen. A server-supplied Retry-After wins if
     it asks for longer.
+
+    `when` is used only for reporting, so tick hours and candle days can share
+    this one implementation.
     """
-    url = hour_url(symbol, hour)
     last = ""
 
     for attempt in range(attempts):
         delay = min(backoff * (2**attempt), max_backoff)
         try:
             response = session.get(url, timeout=timeout, headers={"User-Agent": USER_AGENT})
-            if response.status_code == 404:
+            if response.status_code == 404:  # noqa: PLR2004
                 return b""
             if response.status_code == 200:
                 return response.content
@@ -282,7 +284,7 @@ def download_hour(
 
         if attempt < attempts - 1:
             if on_retry:
-                on_retry(hour, attempt + 1, delay, last)
+                on_retry(when, attempt + 1, delay, last)
             time.sleep(delay)
 
     raise DownloadError(
@@ -290,6 +292,11 @@ def download_hour(
         "A run of 503s means Dukascopy is throttling; wait a few minutes and "
         "re-run the same command - completed days are skipped automatically."
     )
+
+
+def download_hour(session: requests.Session, symbol: str, hour: datetime, **kwargs) -> bytes:
+    """Fetch one hour of tick data."""
+    return download_url(session, hour_url(symbol, hour), hour, **kwargs)
 
 
 def iter_daily_ticks(

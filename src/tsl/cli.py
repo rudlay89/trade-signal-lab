@@ -230,6 +230,80 @@ def cmd_peek(args) -> int:
     return 0
 
 
+def cmd_verify_candles(args) -> int:
+    """Prove the candle record layout by comparing it against tick-derived bars.
+
+    Tick data is expensive to download and candle data is cheap, but the candle
+    record layout is an assumption. This settles it: fetch a day that has already
+    been built from raw ticks, build the same day from candles, and compare them
+    minute by minute. Two independent paths agreeing is proof; a plausibility
+    check is not.
+    """
+    import requests
+
+    from .data.candles import compare_bar_series, download_day_candles
+    from .data.dukascopy import DownloadError
+
+    universe, _ = _load(args.config)
+    universe[args.symbol]  # validate the symbol
+    source = _raw_source(args.config, args.symbol)
+    store = BarStore(args.data)
+
+    stored = store.read(args.symbol, BASE_TIMEFRAME)
+    if stored.empty:
+        print(f"No tick-derived bars stored for {args.symbol}, so there is nothing to")
+        print("compare against. Download a day or two of ticks first:")
+        print(f"  python -m tsl download {args.symbol} 2024-01-08 2024-01-10")
+        return 1
+
+    days = sorted({ts.date() for ts in stored.index})[: args.days]
+    print(f"Verifying the candle format for {args.symbol} against "
+          f"{len(days)} day(s) of tick-derived bars.")
+    print(f"This costs {len(days) * 2} requests - two per day, versus 24 for ticks.\n")
+
+    session = requests.Session()
+    try:
+        for day in days:
+            when = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
+            print(f"  {day}  fetching... ", end="", flush=True)
+            try:
+                from_candles = download_day_candles(session, source, when)
+            except DownloadError as exc:
+                print(f"\n\nDownload failed: {exc}")
+                return 3
+
+            if from_candles.empty:
+                print("no candles returned (market closed?)")
+                continue
+
+            from_ticks = stored[stored.index.normalize().date == day]
+            result = compare_bar_series(from_ticks, from_candles)
+
+            print(f"{result['overlapping']:,} overlapping minutes")
+            if result["overlapping"] == 0:
+                print(f"    {result['verdict']}")
+                continue
+
+            print(f"    worst difference {result['worst_diff']:.6g}, "
+                  f"typical spread {result['typical_spread']:.6g}")
+            for column in ("open", "high", "low", "close"):
+                print(f"      {column:6} max {result[f'{column}_max_diff']:.6g}   "
+                      f"median {result[f'{column}_median_diff']:.6g}")
+            print(f"    {result['verdict']}")
+
+            if not result["passed"]:
+                print("\nThe two sources disagree by more than a spread. Most likely the")
+                print("field order assumed in src/tsl/data/candles.py is wrong.")
+                print("Do not use candle downloads until this is resolved.")
+                return 2
+    finally:
+        session.close()
+
+    print("\nCandle format verified. Bulk downloads can use it, which is roughly")
+    print("twelve times fewer requests than tick files for the same 1-minute bars.")
+    return 0
+
+
 def cmd_check(args) -> int:
     store = BarStore(args.data)
     bars = store.read(args.symbol, args.timeframe)
@@ -270,6 +344,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("symbol")
     p.add_argument("timeframe", nargs="?", default="15min")
     p.set_defaults(func=cmd_peek)
+
+    p = sub.add_parser("verify-candles",
+                       help="prove the candle format against already-downloaded tick data")
+    p.add_argument("symbol")
+    p.add_argument("--days", type=int, default=2, help="how many stored days to check")
+    p.set_defaults(func=cmd_verify_candles)
 
     p = sub.add_parser("check", help="run quality checks over stored bars")
     p.add_argument("symbol")

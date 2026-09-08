@@ -174,6 +174,47 @@ Telegram bot token and any broker credentials go in a `.env` file that is **neve
 (`.gitignore` already covers it), and the paper-trading journal with your actual positions stays
 local. If you later want the repo private, it's a one-click change in GitHub settings.
 
+## D19 — Tick decoding verified against live data (2026-09)
+First real downloads confirmed both instruments tested:
+
+| Instrument | Evidence | Verdict |
+| --- | --- | --- |
+| EURUSD | 2 days, 181,346 ticks, all within the plausible band | `point_scale: 100000` correct |
+| XAUUSD | 2 days, ~1,380 bars/day, prices 2019–2046 for 8–9 Jan 2024, matching where gold actually traded | `point_scale: 1000` correct |
+
+Two independent corroborations beyond the range check:
+- **1,380 one-minute bars per day = 23 × 60.** The daily rollover break appears
+  exactly where it should, which a mis-decoded file would not produce.
+- **Gold's measured spread — median 0.33, max 1.94 — sits on the assumed 0.35.**
+  So the gold cost assumption is sound. The other five remain guesses.
+
+The remaining four instruments' scale factors are still unverified. Each is
+checked on its first download.
+
+## D20 — Throttling is the binding constraint, so bulk downloads use candle files
+Dukascopy throttles sustained downloading hard, and from Perth the round trip is
+long enough that throttling shows up as a mix of 503s, read timeouts and dropped
+connections. Even at 1.5s between requests a three-day download did not complete
+in one run.
+
+Tick files are **24 requests per instrument-day**. A year of five instruments is
+~44,000 requests — over a day of downloading at a survivable pace, which makes
+the dataset the project's critical path.
+
+Dukascopy also publishes pre-aggregated 1-minute candles, one file per day per
+side: `{SYMBOL}/{YYYY}/{MM}/{DD}/{BID|ASK}_candles_min_1.bi5`. Two requests per
+instrument-day instead of twenty-four, for the same 1-minute bars.
+
+**Consequence:** bulk history comes from candle files; tick files stay available
+for any period needing sub-minute detail. The candle record layout is assumed
+(open, **close**, low, high — an unusual order), so it is verified rather than
+trusted:
+- the decoder rejects any file where the nominal high is not the highest of the
+  four prices, which is what a wrong field order produces on nearly every candle;
+- `tsl verify-candles` rebuilds days already derived from raw ticks and compares
+  them minute by minute. Two independent paths agreeing is proof; a plausibility
+  check is not.
+
 ---
 
 ## Still open

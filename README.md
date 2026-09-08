@@ -84,8 +84,24 @@ error:
 If you are being throttled persistently, slow down: `--pause 1.5` puts a second
 and a half between requests. It takes longer and gets there.
 
-Downloading a month of one instrument is a few hundred requests. Be unhurried
-about it; this is a free service.
+### Two download paths
+
+* **Tick files** — 24 requests per instrument-day, full sub-minute detail.
+  Verified correct for EURUSD and XAUUSD against live data.
+* **Daily candle files** — 2 requests per instrument-day for the same 1-minute
+  bars. Roughly twelve times cheaper, which is what makes a multi-year dataset
+  practical when the server throttles.
+
+The candle record layout is an assumption until proven, so prove it before
+relying on it:
+
+```bash
+.venv/bin/python -m tsl verify-candles XAUUSD
+```
+
+That rebuilds days you already have from raw ticks, using candles instead, and
+compares them minute by minute. Agreement to within a spread confirms the
+format. It costs four requests.
 
 ## Guiding principles
 
