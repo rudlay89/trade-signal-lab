@@ -122,8 +122,8 @@ def cmd_download(args) -> int:
             print(f"  {hour:%Y-%m-%d}  ", end="", flush=True)
 
     def retry(hour, attempt, delay, why):
-        print(f"\n    {why} on {hour:%Y-%m-%d %H}h - waiting {delay:.0f}s "
-              f"(attempt {attempt}), this is throttling, not a fault", flush=True)
+        print(f"\n    {why} at {hour:%H}h, waiting {delay:.0f}s (attempt {attempt})",
+              end="", flush=True)
 
     stored_days = 0
     stored_bars = 0
@@ -174,6 +174,62 @@ def cmd_download(args) -> int:
     return 0 if report.ok else 2
 
 
+def cmd_peek(args) -> int:
+    """Show real stored prices, so a human can confirm they are actually right.
+
+    The plausible-range check on import only proves the numbers are not absurd.
+    A scale error of 2x would pass it. Nothing catches that except somebody who
+    knows roughly what the instrument was worth looking at the figures.
+    """
+    universe, _ = _load(args.config)
+    spec = universe[args.symbol]
+    bars = BarStore(args.data).read(args.symbol, args.timeframe)
+
+    if bars.empty:
+        print(f"No {args.timeframe} bars stored for {args.symbol}.")
+        print(f"Download some first:  python -m tsl download {args.symbol} 2024-01-08 2024-01-11")
+        return 1
+
+    dp = spec.price_precision
+    print(f"{args.symbol} {args.timeframe} - {len(bars):,} bars, "
+          f"{bars.index[0]:%Y-%m-%d %H:%M} to {bars.index[-1]:%Y-%m-%d %H:%M} UTC\n")
+
+    def show(rows, title):
+        print(title)
+        for ts, row in rows.iterrows():
+            print(f"  {ts:%Y-%m-%d %H:%M}  O {row['open']:>10.{dp}f}  H {row['high']:>10.{dp}f}  "
+                  f"L {row['low']:>10.{dp}f}  C {row['close']:>10.{dp}f}   "
+                  f"spread {row['spread_mean']:.{dp}f}")
+
+    show(bars.head(3), "First bars:")
+    if len(bars) > 6:
+        print("  ...")
+        show(bars.tail(3), "")
+
+    close = bars["close"]
+    print(f"\nSummary:")
+    print(f"  close    min {close.min():.{dp}f}   max {close.max():.{dp}f}   mean {close.mean():.{dp}f}")
+    print(f"  spread   median {bars['spread_mean'].median():.{dp}f}   "
+          f"max {bars['spread_max'].max():.{dp}f}   "
+          f"(assumed in config: {float(spec.assumed_spread):.{dp}f})")
+
+    days = bars.index.normalize().nunique()
+    print(f"  coverage {days} day(s), about {len(bars) // max(days, 1):,} bars per day")
+
+    print("\n" + "-" * 70)
+    print("SANITY CHECK - do these prices look right to you?")
+    print(f"Pull up a {args.symbol} chart for {bars.index[0]:%B %Y} and compare.")
+    print("A scale error is off by a factor of 10, 100 or 1000, so it is obvious")
+    print("once you look. If the numbers are wrong, the point_scale for")
+    print(f"{args.symbol} in config/instruments.yaml needs changing - tell me by how much.")
+
+    if bars["spread_mean"].median() > float(spec.assumed_spread) * 5:
+        print("\nNOTE: the real spread is far wider than the config assumes. Worth")
+        print("      raising assumed_spread before backtesting, or costs will be")
+        print("      understated and results too optimistic.")
+    return 0
+
+
 def cmd_check(args) -> int:
     store = BarStore(args.data)
     bars = store.read(args.symbol, args.timeframe)
@@ -209,6 +265,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--restart", action="store_true",
                    help="re-download days already recorded as complete")
     p.set_defaults(func=cmd_download)
+
+    p = sub.add_parser("peek", help="show stored prices so you can verify they are right")
+    p.add_argument("symbol")
+    p.add_argument("timeframe", nargs="?", default="15min")
+    p.set_defaults(func=cmd_peek)
 
     p = sub.add_parser("check", help="run quality checks over stored bars")
     p.add_argument("symbol")
