@@ -228,3 +228,62 @@ def test_scattered_gaps_are_not_mistaken_for_a_daily_break():
 
     report = check_bars(holed, "XAUUSD", "1min")
     assert [f for f in report.findings if f.code == "missing_bars"], str(report)
+
+
+def _year_with_dst_shift(shift_after="2024-01-29"):
+    """A continuous minute series with the weekend and the daily rollover break
+    cut out of it, where the break moves by an hour partway through - as it
+    really does when daylight saving changes.
+
+    Built by removal rather than by generating each day separately, so the gaps
+    land where real gaps land: trading resumes at 23:00 UTC before the shift and
+    22:00 after it.
+    """
+    index = pd.date_range("2024-01-08", "2024-02-16", freq="1min", tz="UTC")
+    frame = pd.DataFrame(index=index)
+
+    weekend = index.dayofweek >= 5
+    before = index < pd.Timestamp(shift_after, tz="UTC")
+    # Winter: closed 22:00-23:00, so trading resumes at 23:00.
+    # Summer: closed 21:00-22:00, so trading resumes at 22:00.
+    in_break = ((before & (index.hour == 22)) | (~before & (index.hour == 21)))
+
+    keep = index[~weekend & ~in_break]
+    bars = pd.DataFrame(
+        {
+            "open": 2030.0, "high": 2030.5, "low": 2029.5, "close": 2030.2,
+            "spread_mean": 0.30, "spread_max": 0.35, "tick_count": 10, "volume": 5.0,
+        },
+        index=keep,
+    )
+    bars.index.name = "timestamp"
+    return bars
+
+
+def test_a_daylight_saving_shift_does_not_become_missing_data():
+    """REGRESSION. The break's wall-clock hour moves with US daylight saving. A
+    year of real gold gave 135 breaks resuming at 22:00 UTC and 75 at 23:00; a
+    detector assuming one hour reported the entire winter as missing bars."""
+    from tsl.data.quality import check_bars
+
+    report = check_bars(_year_with_dst_shift(), "XAUUSD", "1min")
+
+    daily = [f for f in report.findings if f.code == "daily_break"]
+    assert daily, str(report)
+    assert "22:00" in daily[0].message and "23:00" in daily[0].message
+    assert "daylight saving" in daily[0].message
+
+    assert not [f for f in report.findings if f.code == "missing_bars"], str(report)
+
+
+def test_a_real_hole_still_surfaces_alongside_two_break_hours():
+    """The break must not become a blanket excuse for missing data."""
+    from tsl.data.quality import check_bars
+
+    bars = _year_with_dst_shift()
+    midday = pd.Timestamp("2024-01-17 11:00", tz="UTC")
+    holed = bars[(bars.index < midday) | (bars.index > midday + pd.Timedelta(hours=2))]
+
+    report = check_bars(holed, "XAUUSD", "1min")
+    assert [f for f in report.findings if f.code == "daily_break"], str(report)
+    assert [f for f in report.findings if f.code == "missing_bars"], str(report)

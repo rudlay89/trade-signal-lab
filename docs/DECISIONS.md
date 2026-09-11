@@ -287,11 +287,39 @@ Saturday and Sunday counts at zero and every weekday equal.
 **A consequence worth naming.** Once padding is gone, each trading day has an
 hour-long hole where the venue closes and reopens. The gap check flagged every
 one of them — about 250 warnings a year for ordinary market structure, which
-would teach anyone reading the report to ignore it. The check now finds the
-rollover empirically, by looking for the hour most gaps resume at, and reports it
-once as information. The hour is not hardcoded because it shifts with US daylight
-saving and differs between venues. Scattered holes do not concentrate on a single
-hour, so a genuine mid-session gap is still a warning.
+would teach anyone reading the report to ignore it.
+
+The rollover is found empirically rather than hardcoded, because its wall-clock
+hour differs between venues **and moves within a single year**. A full year of
+XAUUSD showed:
+
+| Resume hour (UTC) | Count | Predicted from 2024 DST dates |
+| --- | --- | --- |
+| 22:00 | 135 | 136 (≈34 weeks × 4) |
+| 23:00 | 75 | 72 (≈18 weeks × 4) |
+
+That is one break, shifted by US daylight saving. A first attempt at the detector
+assumed a single modal hour and duly reported the entire winter — 75 gaps — as
+missing data, despite its own docstring noting that the hour shifts. Any hour
+accounting for at least 15% of non-weekend gaps now counts as structural.
+
+Genuine holes scatter across the clock rather than concentrating on an hour, so a
+real mid-session gap still surfaces as a warning. The break must not become a
+blanket excuse for missing data.
+
+## D22 — A year of XAUUSD is downloaded and clean (2024)
+526,920 raw bars → **355,892** after repair. Corroborations:
+
+- The raw count is 120 short of 366 × 1,440, which is exactly the two days
+  fetched as ticks (1,380 each) rather than candles. The store merged the two
+  sources to the bar.
+- **101 bars are flat but carry volume** — real single-tick minutes. Requiring
+  both padding signatures kept them, which is what the conservative filter is for.
+- **5,147 weekend bars survived the filter.** Saturday is empty; these are the
+  Sunday evening open, which is genuine trading.
+- The ~250 remaining price spikes cluster at 13:30 UTC — US data release time.
+  Those are real market moves, not bad ticks, and their timing is itself evidence
+  the timestamps are correct.
 
 ---
 

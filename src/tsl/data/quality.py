@@ -18,6 +18,13 @@ import numpy as np
 import pandas as pd
 
 
+# An hour must account for at least this share of non-weekend gaps to count as a
+# structural daily break. Low enough to catch both sides of a daylight saving
+# change - the smaller side was 36% of a year of gold - and high enough that
+# scattered real holes, which spread across the clock, never reach it.
+_STRUCTURAL_HOUR_SHARE = 0.15
+
+
 @dataclass(frozen=True)
 class Finding:
     severity: str          # "error" | "warning" | "info"
@@ -179,19 +186,22 @@ def _check_gaps(bars: pd.DataFrame, report: QualityReport, timeframe: str, max_g
     """Missing bars inside what should be a continuous trading session.
 
     Two kinds of gap are EXPECTED and must not be reported as faults, or the
-    report fills with a couple of hundred warnings a year and stops being read:
+    report fills with hundreds of warnings a year and stops being read:
 
       * the weekend, when the market is shut;
       * the daily rollover break, an hour or so each day when the venue closes
         and reopens.
 
-    The rollover is found empirically rather than hardcoded. Its wall-clock hour
-    shifts with US daylight saving and differs between venues, so the check looks
-    for the hour at which most gaps end and treats short gaps ending there as
-    structural. That adapts to whatever feed is in use instead of encoding one.
+    The rollover is found empirically rather than hardcoded, and crucially it can
+    occupy MORE THAN ONE wall-clock hour across a year. US daylight saving moves
+    it: a year of gold showed 135 breaks resuming at 22:00 UTC and 75 at 23:00,
+    against 136 and 72 predicted from the 2024 DST dates. A detector that assumed
+    a single hour reported the entire winter as missing data.
 
-    What matters is the third kind: a hole on a Tuesday afternoon, which means
-    the download was incomplete.
+    So any hour accounting for a meaningful share of gaps is treated as
+    structural. Genuine holes do not concentrate on an hour - they scatter - so a
+    real mid-session gap still surfaces as a warning. That distinction is the
+    whole point: the break must not become a blanket excuse for missing data.
     """
     try:
         step = pd.Timedelta(timeframe)
@@ -210,27 +220,34 @@ def _check_gaps(bars: pd.DataFrame, report: QualityReport, timeframe: str, max_g
     previous = bars.index.to_series().shift()
     weekend = (previous.dt.dayofweek == 4) | (bars.index.to_series().dt.dayofweek == 6)
 
-    candidates = bars.index[suspicious & ~weekend]
+    selector = suspicious & ~weekend
+    candidates = bars.index[selector]
     if len(candidates) == 0:
         return
 
-    # The daily break: the hour most gaps resume at, when that is a clear
-    # majority. One-off holes will not concentrate on a single hour.
+    # An hour qualifies as structural when it accounts for a meaningful share of
+    # gaps and recurs. Two such hours is the normal case, either side of a
+    # daylight saving change.
     resumes_at = pd.Series(candidates.hour)
-    modal_hour = int(resumes_at.mode().iloc[0])
-    share = float((resumes_at == modal_hour).mean())
+    counts = resumes_at.value_counts()
+    structural_hours = sorted(
+        int(hour) for hour, n in counts.items()
+        if n >= 3 and n / len(resumes_at) >= _STRUCTURAL_HOUR_SHARE
+    )
 
-    short_enough = deltas[suspicious & ~weekend] < pd.Timedelta(hours=4)
-    is_daily_break = (resumes_at.to_numpy() == modal_hour) & short_enough.to_numpy()
+    short_enough = (deltas[selector] < pd.Timedelta(hours=4)).to_numpy()
+    is_break = resumes_at.isin(structural_hours).to_numpy() & short_enough
 
-    if share >= 0.5 and is_daily_break.sum() >= 3:
+    if structural_hours and is_break.sum() >= 3:
+        hours = ", ".join(f"{h:02d}:00" for h in structural_hours)
+        detail = " (two hours because daylight saving moves it)" if len(structural_hours) > 1 else ""
         report.findings.append(
             Finding("info", "daily_break",
-                    f"{int(is_daily_break.sum())} daily trading break(s), resuming at "
-                    f"{modal_hour:02d}:00 UTC - expected, not a data fault",
-                    int(is_daily_break.sum()))
+                    f"{int(is_break.sum())} daily trading break(s), resuming at "
+                    f"{hours} UTC{detail} - expected, not a data fault",
+                    int(is_break.sum()))
         )
-        holes = candidates[~is_daily_break]
+        holes = candidates[~is_break]
     else:
         holes = candidates
 
