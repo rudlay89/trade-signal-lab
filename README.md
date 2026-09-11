@@ -86,22 +86,18 @@ and a half between requests. It takes longer and gets there.
 
 ### Two download paths
 
-* **Tick files** — 24 requests per instrument-day, full sub-minute detail.
-  Verified correct for EURUSD and XAUUSD against live data.
-* **Daily candle files** — 2 requests per instrument-day for the same 1-minute
-  bars. Roughly twelve times cheaper, which is what makes a multi-year dataset
-  practical when the server throttles.
+* **Daily candle files** (default) — 2 requests per instrument-day. Verified
+  against tick-derived bars: open and close match exactly, high and low within
+  about one spread.
+* **Tick files** (`--source ticks`) — 24 requests per instrument-day, full
+  sub-minute detail. Verified for EURUSD and XAUUSD against live data.
 
-The candle record layout is an assumption until proven, so prove it before
-relying on it:
+Both produce identical 1-minute bars. Candles are the default because throttling,
+not bandwidth, is what makes a multi-year download slow — a year of five
+instruments is about 3,700 requests instead of 44,000.
 
-```bash
-.venv/bin/python -m tsl verify-candles XAUUSD
-```
-
-That rebuilds days you already have from raw ticks, using candles instead, and
-compares them minute by minute. Agreement to within a spread confirms the
-format. It costs four requests.
+`tsl verify-candles SYMBOL` re-proves the candle format against any tick data you
+already hold, for four requests. Worth running once per instrument.
 
 ## Guiding principles
 

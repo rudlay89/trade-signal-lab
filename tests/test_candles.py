@@ -261,3 +261,67 @@ def test_verify_without_tick_data_says_what_to_run(tmp_path, capsys):
 
     assert main(["--data", str(tmp_path), "verify-candles", "XAUUSD"]) == 1
     assert "download XAUUSD" in capsys.readouterr().out
+
+
+# --- spread, which the cost model depends on ---------------------------------
+
+
+def _sided(bars, half_spread, high_extra=0.0):
+    """Build bid/ask candle frames around mid bars, optionally widening the
+    spread at the highs so the max-spread estimate has something to find."""
+    bid, ask = bars.copy(), bars.copy()
+    for column in ("open", "high", "low", "close"):
+        bid[column] = bars[column] - half_spread
+        ask[column] = bars[column] + half_spread
+    ask["high"] = ask["high"] + high_extra
+    bid["high"] = bid["high"] - high_extra
+    return bid, ask
+
+
+def test_spread_mean_comes_from_the_open_and_close_quotes():
+    bars = _gold_bars(hours=1)
+    combined = candles_to_bars(*_sided(bars, 0.15))
+    assert combined["spread_mean"].iloc[0] == pytest.approx(0.30)
+
+
+def test_spread_max_is_a_spread_not_the_bar_range():
+    """REGRESSION. This was computed as high_ask - low_bid, which is the bar's
+    range plus a spread. On gold that reads about $2.30 where the real spread is
+    $0.33 - every bar a false blowout, and costs overstated sixfold."""
+    bars = _gold_bars(hours=2)
+    bid, ask = _sided(bars, 0.15)
+    combined = candles_to_bars(bid, ask)
+
+    # The spread is a constant 0.30 here, so that is the only correct answer.
+    assert combined["spread_max"].max() == pytest.approx(0.30)
+
+    # And it must not be what the old formula gave, which folded in the range.
+    buggy = (ask["high"] - bid["low"]).rename("buggy")
+    assert (buggy > 0.30).mean() > 0.9, "test data must have real range to be meaningful"
+    assert (combined["spread_max"] < buggy).mean() > 0.9
+
+
+def test_spread_max_finds_a_genuine_widening():
+    bars = _gold_bars(hours=1)
+    combined = candles_to_bars(*_sided(bars, 0.15, high_extra=0.5))
+    assert combined["spread_max"].iloc[0] == pytest.approx(1.30)
+    assert combined["spread_mean"].iloc[0] == pytest.approx(0.30)
+
+
+def test_spread_is_never_negative():
+    bars = _gold_bars(hours=1)
+    combined = candles_to_bars(*_sided(bars, 0.15))
+    assert (combined["spread_mean"] >= 0).all()
+    assert (combined["spread_max"] >= 0).all()
+
+
+def test_candle_bars_pass_the_quality_checks():
+    """The false-blowout bug would have shown up here."""
+    from tsl.data.quality import check_bars
+
+    bars = _gold_bars(hours=8)
+    combined = candles_to_bars(*_sided(bars, 0.165))
+    report = check_bars(combined, "XAUUSD", "1min")
+
+    assert report.ok, str(report)
+    assert not any(f.code == "spread_blowout" for f in report.findings), str(report)

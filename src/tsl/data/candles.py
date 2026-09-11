@@ -241,14 +241,34 @@ def candles_to_bars(bid: pd.DataFrame, ask: pd.DataFrame) -> pd.DataFrame:
     for column in ("open", "high", "low", "close"):
         out[column] = (joined[f"{column}_bid"] + joined[f"{column}_ask"]) / 2.0
 
-    spread = joined["close_ask"] - joined["close_bid"]
-    out["spread_mean"] = spread
-    out["spread_max"] = joined["high_ask"] - joined["low_bid"]
-    # Candle files carry volume but not a tick count. Zero is honest: this series
-    # genuinely does not know, and inventing a number would be worse.
-    out["tick_count"] = 1
+    # SPREAD. Only the open and close spreads are exact: each is the gap between
+    # bid and ask at one real instant, the minute's first and last tick. The high
+    # of the bid and the high of the ask need not occur at the same moment, so a
+    # spread taken across them is an estimate.
+    #
+    # Do NOT compute this as high_ask - low_bid. That is the bar's RANGE plus a
+    # spread - on gold roughly $2.30 where the spread is $0.33 - and it would
+    # both flag every bar as a spread blowout and overstate trading costs
+    # sixfold anywhere it was used as one.
+    open_spread = joined["open_ask"] - joined["open_bid"]
+    close_spread = joined["close_ask"] - joined["close_bid"]
+    high_spread = joined["high_ask"] - joined["high_bid"]
+    low_spread = joined["low_ask"] - joined["low_bid"]
+
+    out["spread_mean"] = ((open_spread + close_spread) / 2.0).clip(lower=0.0)
+    out["spread_max"] = pd.concat(
+        [open_spread, close_spread, high_spread, low_spread], axis=1
+    ).max(axis=1).clip(lower=0.0)
+
     out["volume"] = joined["volume_bid"] + joined["volume_ask"]
 
+    # Candle files carry volume but no tick count - this series genuinely does not
+    # know how many ticks formed each bar. 1 is a placeholder meaning "unknown but
+    # non-empty": it keeps these bars past the tick_count > 0 filter that drops
+    # empty intervals, and makes the tick-weighted spread average in
+    # resample_bars fall back to a plain average, which is the right behaviour
+    # when no weights exist. It is not a claim that one tick occurred.
+    out["tick_count"] = 1
     out["tick_count"] = out["tick_count"].astype("int64")
     out.index.name = "timestamp"
     return out.sort_index()

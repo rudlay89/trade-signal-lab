@@ -246,7 +246,7 @@ def test_download_stores_bars_and_records_the_days(fake_feed, tmp_path, capsys):
 
     code = main([
         "--data", str(tmp_path), "download", "EURUSD",
-        "2024-01-08", "2024-01-10", "--pause", "0",
+        "2024-01-08", "2024-01-10", "--pause", "0", "--source", "ticks",
     ])
     assert code == 0, capsys.readouterr().out
 
@@ -269,7 +269,7 @@ def test_throttling_partway_keeps_the_finished_day(fake_feed, tmp_path, capsys):
 
     code = main([
         "--data", str(tmp_path), "download", "EURUSD",
-        "2024-01-08", "2024-01-11", "--pause", "0",
+        "2024-01-08", "2024-01-11", "--pause", "0", "--source", "ticks",
     ])
     assert code == 3
 
@@ -285,14 +285,14 @@ def test_rerunning_resumes_instead_of_starting_over(fake_feed, tmp_path, capsys)
     from tsl.cli import main
 
     fake_feed["fail_after"] = 30
-    main(["--data", str(tmp_path), "download", "EURUSD", "2024-01-08", "2024-01-11", "--pause", "0"])
+    main(["--data", str(tmp_path), "download", "EURUSD", "2024-01-08", "2024-01-11", "--pause", "0", "--source", "ticks"])
 
     # Second run: the throttle has cleared.
     fake_feed["fail_after"] = None
     fake_feed["calls"] = 0
     capsys.readouterr()
 
-    code = main(["--data", str(tmp_path), "download", "EURUSD", "2024-01-08", "2024-01-11", "--pause", "0"])
+    code = main(["--data", str(tmp_path), "download", "EURUSD", "2024-01-08", "2024-01-11", "--pause", "0", "--source", "ticks"])
     out = capsys.readouterr().out
 
     assert code == 0, out
@@ -307,11 +307,11 @@ def test_rerunning_resumes_instead_of_starting_over(fake_feed, tmp_path, capsys)
 def test_a_fully_downloaded_range_does_nothing_the_second_time(fake_feed, tmp_path, capsys):
     from tsl.cli import main
 
-    main(["--data", str(tmp_path), "download", "EURUSD", "2024-01-08", "2024-01-10", "--pause", "0"])
+    main(["--data", str(tmp_path), "download", "EURUSD", "2024-01-08", "2024-01-10", "--pause", "0", "--source", "ticks"])
     fake_feed["calls"] = 0
     capsys.readouterr()
 
-    assert main(["--data", str(tmp_path), "download", "EURUSD", "2024-01-08", "2024-01-10", "--pause", "0"]) == 0
+    assert main(["--data", str(tmp_path), "download", "EURUSD", "2024-01-08", "2024-01-10", "--pause", "0", "--source", "ticks"]) == 0
     assert "already stored" in capsys.readouterr().out
     assert fake_feed["calls"] == 0
 
@@ -319,9 +319,95 @@ def test_a_fully_downloaded_range_does_nothing_the_second_time(fake_feed, tmp_pa
 def test_restart_forces_a_re_download(fake_feed, tmp_path, capsys):
     from tsl.cli import main
 
-    main(["--data", str(tmp_path), "download", "EURUSD", "2024-01-08", "2024-01-10", "--pause", "0"])
+    main(["--data", str(tmp_path), "download", "EURUSD", "2024-01-08", "2024-01-10", "--pause", "0", "--source", "ticks"])
     fake_feed["calls"] = 0
 
     main(["--data", str(tmp_path), "download", "EURUSD", "2024-01-08", "2024-01-10",
-          "--pause", "0", "--restart"])
+          "--pause", "0", "--restart", "--source", "ticks"])
     assert fake_feed["calls"] == 48
+
+
+# --- the candle download path ------------------------------------------------
+
+
+@pytest.fixture
+def fake_candle_feed(monkeypatch):
+    """Serve synthetic candle files for both sides of the book."""
+    from tsl.data import candles as candles_module
+    from tsl.data.bars import ticks_to_bars
+    from tsl.data.synthetic import synthetic_candle_file
+
+    state = {"calls": 0, "fail_after": None}
+    GOLD = SourceSpec("XAUUSD", 1000.0, 500.0, 10000.0)
+
+    def fake_download_url(session, url, when, **kwargs):
+        state["calls"] += 1
+        if state["fail_after"] is not None and state["calls"] > state["fail_after"]:
+            raise DownloadError(f"{url}: HTTP 503 (simulated throttle)")
+
+        ticks = synthetic_ticks(
+            when, hours=1, ticks_per_hour=300, start_price=2030.0,
+            spread=0.30, volatility=0.04, seed=when.day,
+        )
+        bars = ticks_to_bars(ticks, "1min")
+        half = 0.15 if "BID" not in url else -0.15
+        for column in ("open", "high", "low", "close"):
+            bars[column] = bars[column] + half
+        return synthetic_candle_file(bars, when, GOLD.point_scale)
+
+    monkeypatch.setattr(candles_module, "download_url", fake_download_url)
+    return state
+
+
+def test_candle_download_stores_bars(fake_candle_feed, tmp_path, capsys):
+    from tsl.cli import main
+    from tsl.data.store import BarStore
+
+    code = main([
+        "--data", str(tmp_path), "download", "XAUUSD",
+        "2024-01-08", "2024-01-10", "--pause", "0",
+    ])
+    out = capsys.readouterr().out
+    assert code == 0, out
+
+    assert "from candles" in out
+    assert "open/close/low/high" in out          # the layout is reported, not assumed
+    assert not BarStore(tmp_path).read("XAUUSD", "1min").empty
+    assert DownloadManifest(tmp_path).completed_days("XAUUSD") == {
+        date(2024, 1, 8), date(2024, 1, 9),
+    }
+
+
+def test_candle_download_costs_two_requests_per_day(fake_candle_feed, tmp_path):
+    from tsl.cli import main
+
+    main(["--data", str(tmp_path), "download", "XAUUSD",
+          "2024-01-08", "2024-01-11", "--pause", "0"])
+    assert fake_candle_feed["calls"] == 6      # 3 days x bid + ask, not 72
+
+
+def test_candle_download_resumes_after_throttling(fake_candle_feed, tmp_path, capsys):
+    from tsl.cli import main
+
+    fake_candle_feed["fail_after"] = 3          # partway through day two
+    assert main(["--data", str(tmp_path), "download", "XAUUSD",
+                 "2024-01-08", "2024-01-11", "--pause", "0"]) == 3
+    assert DownloadManifest(tmp_path).completed_days("XAUUSD") == {date(2024, 1, 8)}
+
+    fake_candle_feed["fail_after"] = None
+    fake_candle_feed["calls"] = 0
+    capsys.readouterr()
+
+    assert main(["--data", str(tmp_path), "download", "XAUUSD",
+                 "2024-01-08", "2024-01-11", "--pause", "0"]) == 0
+    assert fake_candle_feed["calls"] == 4       # the two remaining days only
+
+
+def test_ticks_remain_available_as_an_explicit_choice(fake_feed, tmp_path, capsys):
+    from tsl.cli import main
+
+    main(["--data", str(tmp_path), "download", "EURUSD",
+          "2024-01-08", "2024-01-09", "--pause", "0", "--source", "ticks"])
+    out = capsys.readouterr().out
+    assert "from ticks" in out
+    assert fake_feed["calls"] == 24

@@ -231,6 +231,25 @@ Internal consistency narrows; it does not conclude. `tsl verify-candles` does
 that, rebuilding days already derived from raw ticks and comparing them minute by
 minute. Two independent paths agreeing is the proof.
 
+**Verified 2026-09.** Field order is **open / close / low / high**. Across 2,760
+minutes of XAUUSD:
+
+| Field | Max difference | Median |
+| --- | --- | --- |
+| open | 0 | 0 |
+| close | 0 | 0 |
+| high | 0.07 | 0 |
+| low | 0.31 | 0 |
+
+Open and close match *exactly* — both are single ticks, so they must. High and
+low differ on a minority of minutes by at most about one spread, which is the
+expected artefact of the two paths computing extremes differently: ticks take the
+extreme of the mid, candles average the extreme of each side, and those diverge
+only when the spread moves inside the minute.
+
+Candles are now the default download source; `--source ticks` remains for any
+period needing sub-minute detail.
+
 ---
 
 ## Still open

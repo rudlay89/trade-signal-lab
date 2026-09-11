@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -94,6 +95,16 @@ def cmd_size(args) -> int:
 
 
 def cmd_download(args) -> int:
+    """Download history and store it as bars.
+
+    Two sources. Candle files cost two requests per instrument-day; tick files
+    cost twenty-four for the same 1-minute bars. Candles are the default because
+    throttling, not bandwidth, is what makes a multi-year download slow. Ticks
+    remain available for any period needing sub-minute detail.
+    """
+    import requests
+
+    from .data.candles import download_day_candles
     from .data.dukascopy import DownloadError, iter_daily_ticks
 
     universe, _ = _load(args.config)
@@ -108,49 +119,75 @@ def cmd_download(args) -> int:
     already = manifest.completed_days(args.symbol) if not args.restart else set()
 
     total_days = (end - start).days
-    print(f"Downloading {spec.symbol}, {start:%Y-%m-%d} to {end:%Y-%m-%d} ({total_days} days).")
+    per_day = 24 if args.source == "ticks" else 2
+    print(f"Downloading {spec.symbol}, {start:%Y-%m-%d} to {end:%Y-%m-%d} "
+          f"({total_days} days) from {args.source}.")
     if already:
         pending = sum(
             1 for i in range(total_days) if (start + timedelta(days=i)).date() not in already
         )
         print(f"{len(already)} day(s) already downloaded and will be skipped; {pending} to fetch.")
-    print("Dukascopy is free and throttles heavy use, so this is paced deliberately.")
-    print("If it stops, just run the same command again - finished days are not re-fetched.\n")
-
-    def progress(hour, count):
-        if hour.hour == 0:
-            print(f"  {hour:%Y-%m-%d}  ", end="", flush=True)
-
-    def retry(hour, attempt, delay, why):
-        print(f"\n    {why} at {hour:%H}h, waiting {delay:.0f}s (attempt {attempt})",
-              end="", flush=True)
+        total_days = pending
+    print(f"About {total_days * per_day:,} requests at {args.pause}s apart.")
+    print("If it stops, run the same command again - finished days are not re-fetched.\n")
 
     stored_days = 0
     stored_bars = 0
+    reported_layout = False
+
+    def retry(when, attempt, delay, why):
+        print(f"\n    {why} at {when:%Y-%m-%d %H}h, waiting {delay:.0f}s (attempt {attempt})",
+              end="", flush=True)
+
+    def persist(day, bars) -> None:
+        nonlocal stored_days, stored_bars
+        store.write(args.symbol, BASE_TIMEFRAME, bars)
+        for timeframe in ("15min", "1h", "4h"):
+            store.write(args.symbol, timeframe, resample_bars(bars, timeframe))
+        manifest.mark_complete(args.symbol, day)
+        stored_days += 1
+        stored_bars += len(bars)
+
     try:
-        for day, ticks in iter_daily_ticks(
-            source, start, end,
-            pause=args.pause, skip_days=already,
-            on_progress=progress, on_retry=retry,
-        ):
-            if ticks.empty:
-                # Weekend or holiday. Record it so a resume does not ask again.
-                manifest.mark_complete(args.symbol, day.date())
-                print("no ticks (market closed)", flush=True)
-                continue
+        if args.source == "candles":
+            from .data.candles import days_between
 
-            bars = ticks_to_bars(ticks, BASE_TIMEFRAME)
-            store.write(args.symbol, BASE_TIMEFRAME, bars)
-            for timeframe in ("15min", "1h", "4h"):
-                store.write(args.symbol, timeframe, resample_bars(bars, timeframe))
+            session = requests.Session()
+            try:
+                for day in days_between(start, end):
+                    if day.date() in already:
+                        continue
+                    print(f"  {day:%Y-%m-%d}  ", end="", flush=True)
+                    bars = download_day_candles(session, source, day, on_retry=retry)
 
-            manifest.mark_complete(args.symbol, day.date())
-            stored_days += 1
-            stored_bars += len(bars)
-            print(f"{len(ticks):>9,} ticks -> {len(bars):>5,} bars  (saved)", flush=True)
+                    if bars.empty:
+                        manifest.mark_complete(args.symbol, day.date())
+                        print("no candles (market closed)", flush=True)
+                    else:
+                        if not reported_layout and bars.attrs.get("field_order"):
+                            print(f"[{'/'.join(bars.attrs['field_order'])}] ", end="")
+                            reported_layout = True
+                        persist(day.date(), bars)
+                        print(f"{len(bars):>5,} bars  (saved)", flush=True)
+
+                    if args.pause:
+                        time.sleep(args.pause)
+            finally:
+                session.close()
+        else:
+            for day, ticks in iter_daily_ticks(
+                source, start, end, pause=args.pause, skip_days=already, on_retry=retry,
+            ):
+                print(f"  {day:%Y-%m-%d}  ", end="", flush=True)
+                if ticks.empty:
+                    manifest.mark_complete(args.symbol, day.date())
+                    print("no ticks (market closed)", flush=True)
+                    continue
+                bars = ticks_to_bars(ticks, BASE_TIMEFRAME)
+                persist(day.date(), bars)
+                print(f"{len(ticks):>9,} ticks -> {len(bars):>5,} bars  (saved)", flush=True)
 
     except DownloadError as exc:
-        # Not a traceback. The work so far is already on disk.
         print(f"\n\nDownload stopped: {exc}\n")
         print(f"Saved before stopping: {stored_days} day(s), {stored_bars:,} {BASE_TIMEFRAME} bars.")
         print("Nothing is lost. Re-run the same command to continue where it left off.")
@@ -344,6 +381,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("symbol")
     p.add_argument("start", help="YYYY-MM-DD, inclusive")
     p.add_argument("end", help="YYYY-MM-DD, exclusive")
+    p.add_argument("--source", choices=("candles", "ticks"), default="candles",
+                   help="candles: 2 requests/day (default). ticks: 24/day, sub-minute detail")
     p.add_argument("--pause", type=float, default=0.5,
                    help="seconds between requests (default 0.5; raise it if throttled)")
     p.add_argument("--restart", action="store_true",
