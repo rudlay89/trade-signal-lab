@@ -280,7 +280,18 @@ an assumption about the feed.
 
 **Recovery without re-downloading.** Volume is stored, so padding is detectable
 after the fact. `tsl repair` strips it from existing bars and rebuilds the
-15min/1h/4h roll-ups from the cleaned base.
+15min/1h/4h roll-ups from the cleaned base. Verified end to end on a simulated
+97-day store: 139,680 bars → 96,600, which is exactly 70 weekdays × 1,380, with
+Saturday and Sunday counts at zero and every weekday equal.
+
+**A consequence worth naming.** Once padding is gone, each trading day has an
+hour-long hole where the venue closes and reopens. The gap check flagged every
+one of them — about 250 warnings a year for ordinary market structure, which
+would teach anyone reading the report to ignore it. The check now finds the
+rollover empirically, by looking for the hour most gaps resume at, and reports it
+once as information. The hour is not hardcoded because it shifts with US daylight
+saving and differs between venues. Scattered holes do not concentrate on a single
+hour, so a genuine mid-session gap is still a warning.
 
 ---
 

@@ -176,28 +176,68 @@ def _check_flat(bars: pd.DataFrame, report: QualityReport, max_flat: int) -> Non
 
 
 def _check_gaps(bars: pd.DataFrame, report: QualityReport, timeframe: str, max_gap_bars: int) -> None:
-    """Missing bars inside what should be a continuous trading week.
+    """Missing bars inside what should be a continuous trading session.
 
-    Weekend gaps are expected and excluded. What matters is a hole on a Tuesday
-    afternoon, which means the download was incomplete.
+    Two kinds of gap are EXPECTED and must not be reported as faults, or the
+    report fills with a couple of hundred warnings a year and stops being read:
+
+      * the weekend, when the market is shut;
+      * the daily rollover break, an hour or so each day when the venue closes
+        and reopens.
+
+    The rollover is found empirically rather than hardcoded. Its wall-clock hour
+    shifts with US daylight saving and differs between venues, so the check looks
+    for the hour at which most gaps end and treats short gaps ending there as
+    structural. That adapts to whatever feed is in use instead of encoding one.
+
+    What matters is the third kind: a hole on a Tuesday afternoon, which means
+    the download was incomplete.
     """
     try:
         step = pd.Timedelta(timeframe)
     except ValueError:
         return
 
+    if len(bars) < 2:
+        return
+
     deltas = bars.index.to_series().diff()
     suspicious = deltas > step * max_gap_bars
+    if not suspicious.any():
+        return
 
-    # Exclude gaps that span a weekend: Friday evening to Sunday evening UTC.
-    starts = bars.index.to_series().shift()
-    is_weekend_gap = (starts.dt.dayofweek == 4) | (bars.index.to_series().dt.dayofweek == 6)
-    holes = bars.index[suspicious & ~is_weekend_gap]
+    # Weekend gaps: the market closed on Friday and reopened on Sunday.
+    previous = bars.index.to_series().shift()
+    weekend = (previous.dt.dayofweek == 4) | (bars.index.to_series().dt.dayofweek == 6)
+
+    candidates = bars.index[suspicious & ~weekend]
+    if len(candidates) == 0:
+        return
+
+    # The daily break: the hour most gaps resume at, when that is a clear
+    # majority. One-off holes will not concentrate on a single hour.
+    resumes_at = pd.Series(candidates.hour)
+    modal_hour = int(resumes_at.mode().iloc[0])
+    share = float((resumes_at == modal_hour).mean())
+
+    short_enough = deltas[suspicious & ~weekend] < pd.Timedelta(hours=4)
+    is_daily_break = (resumes_at.to_numpy() == modal_hour) & short_enough.to_numpy()
+
+    if share >= 0.5 and is_daily_break.sum() >= 3:
+        report.findings.append(
+            Finding("info", "daily_break",
+                    f"{int(is_daily_break.sum())} daily trading break(s), resuming at "
+                    f"{modal_hour:02d}:00 UTC - expected, not a data fault",
+                    int(is_daily_break.sum()))
+        )
+        holes = candidates[~is_daily_break]
+    else:
+        holes = candidates
 
     if len(holes):
         report.findings.append(
             Finding("warning", "missing_bars",
-                    f"gaps longer than {max_gap_bars} bars inside the trading week",
+                    f"gaps longer than {max_gap_bars} bars inside a trading session",
                     len(holes), tuple(holes[:3]))
         )
 

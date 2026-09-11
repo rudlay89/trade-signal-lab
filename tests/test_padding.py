@@ -166,3 +166,65 @@ def test_a_clean_comparison_says_nothing_about_padding():
     result = compare_bar_series(real, same)
     assert result["only_in_candles"] == 0
     assert "padding" not in result["verdict"]
+
+
+# --- the daily rollover break is expected, not a fault -----------------------
+
+
+def _week_of_bars(break_hour=23):
+    """Five weekdays of 1-minute bars with an hour-long daily break, as the
+    real feed delivers once padding is stripped."""
+    frames = []
+    for day_offset in range(5):
+        day = datetime(2024, 1, 8, tzinfo=UTC) + pd.Timedelta(days=day_offset)
+        ticks = synthetic_ticks(
+            day, hours=break_hour, ticks_per_hour=120, start_price=2030.0,
+            spread=0.30, volatility=0.02, seed=day_offset,
+        )
+        frames.append(ticks_to_bars(ticks, "1min"))
+    return pd.concat(frames)
+
+
+def test_the_daily_break_is_reported_as_expected_not_a_warning():
+    """REGRESSION. Every trading day has an hour when the venue closes. Flagged
+    as a gap, that is ~250 warnings a year for normal market structure, which
+    trains the reader to ignore the report."""
+    from tsl.data.quality import check_bars
+
+    report = check_bars(_week_of_bars(), "XAUUSD", "1min")
+
+    daily = [f for f in report.findings if f.code == "daily_break"]
+    assert daily, str(report)
+    assert daily[0].severity == "info"
+    assert "expected" in daily[0].message
+
+    assert not [f for f in report.findings if f.code == "missing_bars"], str(report)
+    assert report.ok
+
+
+def test_a_real_hole_is_still_reported():
+    """The daily break must not become a blanket excuse for missing data."""
+    from tsl.data.quality import check_bars
+
+    bars = _week_of_bars()
+    midday = pd.Timestamp("2024-01-10 12:00", tz="UTC")
+    holed = bars[(bars.index < midday) | (bars.index > midday + pd.Timedelta(hours=2))]
+
+    report = check_bars(holed, "XAUUSD", "1min")
+    missing = [f for f in report.findings if f.code == "missing_bars"]
+    assert missing, str(report)
+
+
+def test_scattered_gaps_are_not_mistaken_for_a_daily_break():
+    """Random holes do not concentrate on one hour, so they stay warnings."""
+    from tsl.data.quality import check_bars
+
+    bars = _week_of_bars()
+    drop = bars.index[[500, 1500, 2600, 3700, 4800]]
+    holed = bars.drop(
+        [ts for start in drop for ts in pd.date_range(start, periods=30, freq="1min")],
+        errors="ignore",
+    )
+
+    report = check_bars(holed, "XAUUSD", "1min")
+    assert [f for f in report.findings if f.code == "missing_bars"], str(report)
