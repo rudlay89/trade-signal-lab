@@ -250,6 +250,38 @@ only when the spread moves inside the minute.
 Candles are now the default download source; `--source ticks` remains for any
 period needing sub-minute detail.
 
+## D21 — Candle files are padded, and the padding must be stripped
+A year-long gold download made it obvious: **every day returned exactly 1,440
+bars — 24 × 60 — including Saturdays and Sundays.** Tick files give 1,380 (23 ×
+60) for the same instrument, the missing hour being the daily rollover break.
+Candle files carry a record for every minute of the day whether anything traded
+or not.
+
+Left in, that would have been severe:
+- **fabricated overnight ranges on days the market was shut** — the exact input
+  the London breakout strategy reads;
+- **ATR and every volatility measure flattened**, by averaging in minutes that
+  could not have moved;
+- a backtest able to "trade" a closed market.
+
+**Why verification missed it.** `compare_bar_series` matched only the minutes the
+two sources *share*. The padding is precisely the minutes they do not share, so
+1,380 minutes agreed perfectly while 60 fabricated ones sat unexamined beside
+them. The comparison now reports minutes present in one source and absent from
+the other, and says so in the verdict. A validation that only looks where both
+sources agree is not a validation.
+
+**Detection.** A padded minute has no volume *and* no price movement. Both are
+required: a genuine single-tick minute is flat but carries volume, and dropping a
+real bar is worse than keeping a fake one — a hole is silent, whereas a kept bar
+is visible to the gap checks. `tsl diagnose` reports what each signature finds
+separately and flags disagreement, so the filter rests on measurement rather than
+an assumption about the feed.
+
+**Recovery without re-downloading.** Volume is stored, so padding is detectable
+after the fact. `tsl repair` strips it from existing bars and rebuilds the
+15min/1h/4h roll-ups from the cleaned base.
+
 ---
 
 ## Still open

@@ -271,7 +271,18 @@ def candles_to_bars(bid: pd.DataFrame, ask: pd.DataFrame) -> pd.DataFrame:
     out["tick_count"] = 1
     out["tick_count"] = out["tick_count"].astype("int64")
     out.index.name = "timestamp"
-    return out.sort_index()
+    out = out.sort_index()
+
+    # Candle files carry a record for every minute of the day, including minutes
+    # when nothing traded. Those are placeholders, not market data - see
+    # padding.py. Dropping them here means the rest of the system never sees a
+    # fabricated bar.
+    from .padding import drop_padding
+
+    cleaned, dropped = drop_padding(out)
+    cleaned.attrs.update(out.attrs)
+    cleaned.attrs["padded_dropped"] = dropped
+    return cleaned
 
 
 def days_between(start: datetime, end: datetime):
@@ -341,6 +352,12 @@ def compare_bar_series(from_ticks: pd.DataFrame, from_candles: pd.DataFrame) -> 
         "tick_bars": len(from_ticks),
         "candle_bars": len(from_candles),
         "overlapping": len(shared),
+        # THE BLIND SPOT. Comparing only shared minutes says nothing about
+        # minutes one source has and the other does not - which is precisely
+        # where candle padding lives. A candle series with 60 extra fabricated
+        # minutes matched perfectly on the 1,380 they shared.
+        "only_in_candles": len(from_candles.index.difference(from_ticks.index)),
+        "only_in_ticks": len(from_ticks.index.difference(from_candles.index)),
     }
     if len(shared) == 0:
         result["verdict"] = "no overlap - nothing to compare"
@@ -368,4 +385,9 @@ def compare_bar_series(from_ticks: pd.DataFrame, from_candles: pd.DataFrame) -> 
         if result["passed"]
         else "MISMATCH - do not use candle downloads until this is resolved"
     )
+    if result["passed"] and result["only_in_candles"]:
+        result["verdict"] += (
+            f"\n    but {result['only_in_candles']:,} candle minute(s) have no tick "
+            "counterpart - check for padding"
+        )
     return result

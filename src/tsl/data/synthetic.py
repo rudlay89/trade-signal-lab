@@ -71,6 +71,25 @@ def synthetic_bi5(ticks: pd.DataFrame, hour_start: datetime, point_scale: float)
     return lzma.compress(bytes(out), format=lzma.FORMAT_ALONE)
 
 
+def pad_bars(bars, day, minutes: int = 1440):
+    """Fill a bar series out to every minute of the day, as candle files do.
+
+    Padded minutes carry the previous close in all four prices and zero volume -
+    the signature `padding.padded_mask` looks for.
+    """
+    day = day.astimezone(timezone.utc)
+    full = pd.date_range(pd.Timestamp(day), periods=minutes, freq="1min", tz="UTC")
+    out = bars.reindex(full)
+
+    filler = out["close"].ffill().bfill()
+    missing = out["close"].isna()
+    for column in ("open", "high", "low", "close"):
+        out.loc[missing, column] = filler[missing]
+    out.loc[missing, "volume"] = 0.0
+    out.index.name = "timestamp"
+    return out
+
+
 def synthetic_candle_file(
     bars,
     day,

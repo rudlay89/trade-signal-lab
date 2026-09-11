@@ -351,6 +351,106 @@ def cmd_verify_candles(args) -> int:
     return 0
 
 
+def cmd_diagnose(args) -> int:
+    """Measure the padding signatures against real stored data.
+
+    Dukascopy candle files pad minutes that never traded. This reports what the
+    two candidate signatures - no volume, no movement - actually pick out, so the
+    filter rests on evidence rather than an assumption about the feed.
+    """
+    from .data.padding import padding_report
+
+    bars = BarStore(args.data).read(args.symbol, args.timeframe)
+    if bars.empty:
+        print(f"No {args.timeframe} bars stored for {args.symbol}.")
+        return 1
+
+    report = padding_report(bars)
+    print(f"{args.symbol} {args.timeframe} - padding analysis")
+    print(f"  {bars.index[0]:%Y-%m-%d} to {bars.index[-1]:%Y-%m-%d} UTC\n")
+    print(report)
+
+    print("\n" + "-" * 70)
+    if report.weekend:
+        print("WEEKEND BARS PRESENT. The market is shut at weekends, so these are")
+        print("padding. Any bar on a Saturday is proof the feed pads.")
+    if not report.signatures_agree:
+        print("\nTHE TWO SIGNATURES DISAGREE.")
+        print(f"  'no volume' finds {report.zero_volume:,}, 'no movement' finds {report.flat:,},")
+        print(f"  but only {report.both:,} satisfy both.")
+        print("  The filter requires both, so it is the conservative choice - it")
+        print("  keeps anything ambiguous. Worth a look before trusting it.")
+    else:
+        print("\nBoth signatures agree, so padded minutes are unambiguous.")
+
+    if report.both:
+        print(f"\n{report.both:,} bar(s) would be removed by `tsl repair {args.symbol}`.")
+    else:
+        print("\nNo padding found. Nothing to repair.")
+    return 0
+
+
+def cmd_repair(args) -> int:
+    """Strip padded minutes from already-stored bars, without re-downloading.
+
+    The padding is detectable after the fact because volume is stored, so a year
+    of downloading does not have to be repeated to fix it.
+    """
+    from .data.padding import drop_padding, padding_report
+
+    store = BarStore(args.data)
+    timeframes = [args.timeframe] if args.timeframe else [BASE_TIMEFRAME, "15min", "1h", "4h"]
+
+    base = store.read(args.symbol, BASE_TIMEFRAME)
+    if base.empty:
+        print(f"No bars stored for {args.symbol}.")
+        return 1
+
+    before = padding_report(base)
+    if before.both == 0:
+        print(f"{args.symbol}: no padded bars found. Nothing to do.")
+        return 0
+
+    print(f"{args.symbol}: removing {before.both:,} padded minute(s) "
+          f"of {before.total:,}, including {before.weekend_both:,} at weekends.")
+
+    if args.dry_run:
+        print("\nDry run - nothing written. Drop --dry-run to apply.")
+        return 0
+
+    cleaned, dropped = drop_padding(base)
+    if cleaned.empty:
+        print("\nEvery bar looks like padding. Refusing to empty the store.")
+        return 2
+
+    # Rebuild every timeframe from the cleaned base, so the roll-ups cannot
+    # disagree with it.
+    _rewrite(store, args.symbol, BASE_TIMEFRAME, cleaned)
+    for timeframe in ("15min", "1h", "4h"):
+        _rewrite(store, args.symbol, timeframe, resample_bars(cleaned, timeframe))
+
+    print(f"\nDone. {len(cleaned):,} bars remain, and the 15min/1h/4h series were")
+    print("rebuilt from them so nothing disagrees.")
+
+    report = check_bars(cleaned, args.symbol, BASE_TIMEFRAME)
+    print("\n" + str(report))
+    return 0 if report.ok else 2
+
+
+def _rewrite(store: BarStore, symbol: str, timeframe: str, bars) -> None:
+    """Replace a stored series outright.
+
+    The store merges on write, so a padded bar would survive a plain write. The
+    old files are removed first.
+    """
+    import shutil
+
+    directory = store.root / "bars" / symbol / timeframe
+    if directory.exists():
+        shutil.rmtree(directory)
+    store.write(symbol, timeframe, bars)
+
+
 def cmd_check(args) -> int:
     store = BarStore(args.data)
     bars = store.read(args.symbol, args.timeframe)
@@ -399,6 +499,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("symbol")
     p.add_argument("--days", type=int, default=2, help="how many stored days to check")
     p.set_defaults(func=cmd_verify_candles)
+
+    p = sub.add_parser("diagnose", help="measure padding in stored candle data")
+    p.add_argument("symbol")
+    p.add_argument("timeframe", nargs="?", default="1min")
+    p.set_defaults(func=cmd_diagnose)
+
+    p = sub.add_parser("repair", help="strip padded minutes from stored bars")
+    p.add_argument("symbol")
+    p.add_argument("--timeframe", help="default: rebuild every timeframe")
+    p.add_argument("--dry-run", action="store_true", help="report without writing")
+    p.set_defaults(func=cmd_repair)
 
     p = sub.add_parser("check", help="run quality checks over stored bars")
     p.add_argument("symbol")
